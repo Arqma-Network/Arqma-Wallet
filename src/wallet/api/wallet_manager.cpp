@@ -310,6 +310,7 @@ bool WalletManagerImpl::isMining()
 
 bool WalletManagerImpl::startMining(const std::string &address, uint32_t threads)
 {
+    m_errorString.clear();
     cryptonote::COMMAND_RPC_START_MINING::request mreq;
     cryptonote::COMMAND_RPC_START_MINING::response mres;
 
@@ -317,18 +318,66 @@ bool WalletManagerImpl::startMining(const std::string &address, uint32_t threads
     mreq.threads_count = threads;
 
     if (!epee::net_utils::invoke_http_json("/start_mining", mreq, mres, m_http_client))
+    {
+      m_errorString = "Failed to connect to daemon for start_mining";
       return false;
-    return mres.status == CORE_RPC_STATUS_OK;
+    }
+    if (mres.status != CORE_RPC_STATUS_OK)
+    {
+      m_errorString = mres.status.empty() ? std::string{"start_mining failed"} : mres.status;
+      return false;
+    }
+    return true;
 }
 
 bool WalletManagerImpl::stopMining()
 {
+    m_errorString.clear();
     cryptonote::COMMAND_RPC_STOP_MINING::request mreq;
     cryptonote::COMMAND_RPC_STOP_MINING::response mres;
 
     if (!epee::net_utils::invoke_http_json("/stop_mining", mreq, mres, m_http_client))
+    {
+      m_errorString = "Failed to connect to daemon for stop_mining";
       return false;
-    return mres.status == CORE_RPC_STATUS_OK;
+    }
+    if (mres.status != CORE_RPC_STATUS_OK)
+    {
+      m_errorString = mres.status.empty() ? std::string{"stop_mining failed"} : mres.status;
+      return false;
+    }
+    return true;
+}
+
+bool WalletManagerImpl::daemonPosInfo(DaemonPosInfo &info)
+{
+    m_errorString.clear();
+    cryptonote::COMMAND_RPC_GET_INFO::request ireq;
+    cryptonote::COMMAND_RPC_GET_INFO::response ires;
+
+    if (!epee::net_utils::invoke_http_json("/getinfo", ireq, ires, m_http_client))
+    {
+      m_errorString = "Failed to connect to daemon for get_info";
+      return false;
+    }
+    if (ires.status != CORE_RPC_STATUS_OK)
+    {
+      m_errorString = ires.status.empty() ? std::string{"get_info failed"} : ires.status;
+      return false;
+    }
+
+    info.pos_fork_active = ires.pos_fork_active;
+    info.pos_planned_hf_name = std::move(ires.pos_planned_hf_name);
+    info.pos_planned_fork_height = ires.pos_planned_fork_height;
+    info.pos_target_block_time_sec = ires.pos_target_block_time_sec;
+    info.pos_quorum_validators_min = ires.pos_quorum_validators_min;
+    info.pos_signature_threshold = ires.pos_signature_threshold;
+    info.pos_expects_sn_storage_server = ires.pos_expects_sn_storage_server;
+    info.pos_pulse_blocks_since_fork = ires.pos_pulse_blocks_since_fork;
+    info.pos_pulse_next_round_wire_hint = ires.pos_pulse_next_round_wire_hint;
+    info.pos_pulse_cum_diff_uses_60s_lwma = ires.pos_pulse_cum_diff_uses_60s_lwma;
+    info.pos_pulse_arqnet_vote_buffer_blocks = ires.pos_pulse_arqnet_vote_buffer_blocks;
+    return true;
 }
 
 std::string WalletManagerImpl::resolveOpenAlias(const std::string &address, bool &dnssec_valid) const

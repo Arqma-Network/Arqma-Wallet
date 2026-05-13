@@ -31,6 +31,8 @@
 
 #include <thread>
 
+#include <chrono>
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -39,8 +41,10 @@
 // but including here for clarity
 #include "cryptonote_core/cryptonote_core.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
+#include "cryptonote_core/pulse.h"
 #include "ringct/rctSigs.h"
 #include "version.h"
+#include "common/arqma_pulse_fork.h"
 
 namespace cryptonote
 {
@@ -486,6 +490,17 @@ namespace rpc
       return;
     }
 
+    const uint64_t chain_height_hf = m_core.get_current_blockchain_height();
+    const uint64_t next_height_hf = chain_height_hf + 1;
+    const uint8_t next_major_hf = m_core.get_blockchain_storage().get_ideal_hard_fork_version(next_height_hf);
+    if (arqma::pulse_fork::pow_mining_disabled_for_chain(m_core.get_nettype(), next_major_hf, next_height_hf))
+    {
+      res.error_details = arqma::pulse_fork::POW_MINING_DISABLED_RPC_MESSAGE;
+      LOG_PRINT_L0(res.error_details);
+      res.status = Message::STATUS_FAILED;
+      return;
+    }
+
     unsigned int concurrency_count = std::thread::hardware_concurrency() * 4;
 
     // if we couldn't detect threads, set it to a ridiculously high number
@@ -556,6 +571,39 @@ namespace rpc
     res.info.start_time = (uint64_t)m_core.get_start_time();
     res.info.version = ARQMA_VERSION_STR;
     res.info.syncing = m_p2p.get_payload_object().currently_busy_syncing();
+
+    {
+      const cryptonote::network_type net_type = m_core.get_nettype();
+      res.info.pos_fork_active = arqma::pulse_fork::fork_active(net_type);
+      res.info.pos_planned_hf_name = arqma::pulse_fork::HF_RELEASE_NAME;
+      res.info.pos_planned_fork_height = arqma::pulse_fork::planned_fork_height_for_net(net_type);
+      res.info.pos_target_block_time_sec = arqma::pulse_fork::PULSE_TARGET_BLOCK_TIME_SEC;
+      res.info.pos_quorum_validators_min = arqma::pulse_fork::PULSE_QUORUM_VALIDATORS_MIN;
+      res.info.pos_signature_threshold = arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD;
+      res.info.pos_expects_sn_storage_server = arqma::pulse_fork::POS_EXPECTS_STORAGE_SERVER_FOR_SERVICE_NODES;
+
+      uint64_t const fh = arqma::pulse_fork::planned_fork_height_for_net(net_type);
+      res.info.pos_pulse_blocks_since_fork =
+          (arqma::pulse_fork::fork_active(net_type) && fh > 0 && res.info.height > fh) ? (res.info.height - fh) : 0;
+      res.info.pos_pulse_next_round_wire_hint = res.info.height % 256;
+      {
+        uint64_t const next_h = chain.get_current_blockchain_height();
+        uint64_t prev_ts = 0;
+        if (next_h > 0)
+          prev_ts = chain.get_db().get_block_timestamp(next_h - 1);
+        if (auto timings = cryptonote::pulse::get_round_timings(chain, next_h, prev_ts))
+        {
+          uint8_t rnd = 0;
+          if (cryptonote::pulse::convert_time_to_round(net_type, std::chrono::system_clock::now(), timings->r0_timestamp, &rnd))
+            res.info.pos_pulse_next_round_wire_hint = rnd;
+        }
+      }
+      res.info.pos_pulse_cum_diff_uses_60s_lwma =
+          arqma::pulse_fork::fork_active(net_type)
+          && chain.get_ideal_hard_fork_version(chain.get_current_blockchain_height()) >= cryptonote::network_version_20;
+      res.info.pos_pulse_arqnet_vote_buffer_blocks =
+          static_cast<uint64_t>(m_core.get_pulse_arqnet_vote_buffer_distinct_block_count());
+    }
 
     res.status = Message::STATUS_OK;
     res.error_details = "";

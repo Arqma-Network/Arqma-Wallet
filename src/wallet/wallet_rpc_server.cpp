@@ -99,7 +99,8 @@ namespace tools
   //------------------------------------------------------------------------------------------------------------------------------
   wallet_rpc_server::~wallet_rpc_server()
   {
-    stop();
+    if (m_wallet)
+      delete m_wallet;
   }
   //------------------------------------------------------------------------------------------------------------------------------
   void wallet_rpc_server::set_wallet(wallet2 *cr)
@@ -644,10 +645,11 @@ namespace tools
   static std::string ptx_to_string(const tools::wallet2::pending_tx &ptx)
   {
     std::ostringstream oss;
-    boost::archive::portable_binary_oarchive ar(oss);
+    binary_archive<true> ar(oss);
     try
     {
-      ar << ptx;
+      if (!::serialization::serialize(ar, const_cast<tools::wallet2::pending_tx&>(ptx)))
+        return "";
     }
     catch (...)
     {
@@ -1374,14 +1376,31 @@ namespace tools
       return false;
     }
 
+    bool loaded = false;
     tools::wallet2::pending_tx ptx;
+
     try
     {
       std::istringstream iss(blob);
-      boost::archive::portable_binary_iarchive ar(iss);
-      ar >> ptx;
+      binary_archive<false> ar(iss);
+      if (::serialization::serialize(ar, ptx))
+        loaded = true;
     }
-    catch (...)
+    catch(...) { }
+
+    if (!loaded && !m_restricted)
+    {
+      try
+      {
+        std::istringstream iss(blob);
+        boost::archive::portable_binary_iarchive ar(iss);
+        ar >> ptx;
+        loaded = true;
+      }
+      catch (...) {}
+    }
+
+    if (!loaded)
     {
       er.code = WALLET_RPC_ERROR_CODE_BAD_TX_METADATA;
       er.message = "Failed to parse tx metadata.";
@@ -2422,7 +2441,7 @@ namespace tools
 
     try
     {
-      res.outputs_data_hex = epee::string_tools::buff_to_hex_nodelimer(m_wallet->export_outputs_to_str());
+      res.outputs_data_hex = epee::string_tools::buff_to_hex_nodelimer(m_wallet->export_outputs_to_str(req.all));
     }
     catch (const std::exception& e)
     {
@@ -2475,7 +2494,7 @@ namespace tools
     if (!m_wallet) return not_open(er);
     try
     {
-      std::pair<size_t, std::vector<std::pair<crypto::key_image, crypto::signature>>> ski = m_wallet->export_key_images(req.all);
+      std::pair<uint64_t, std::vector<std::pair<crypto::key_image, crypto::signature>>> ski = m_wallet->export_key_images(req.all);
       res.offset = ski.first;
       res.signed_key_images.resize(ski.second.size());
       for (size_t n = 0; n < ski.second.size(); ++n)
@@ -2840,7 +2859,9 @@ namespace tools
     if (!r || daemon_res.status != CORE_RPC_STATUS_OK)
     {
       er.code = WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR;
-      er.message = "Couldn't start mining due to unknown error.";
+      er.message = daemon_res.status.empty()
+          ? std::string{"Couldn't start mining due to unknown error."}
+          : std::string{daemon_res.status};
       return false;
     }
     return true;
@@ -2997,6 +3018,18 @@ namespace tools
       er.message = "Invalid filename";
       return false;
     }
+    if (m_wallet && req.autosave_current)
+    {
+      try
+      {
+        m_wallet->store();
+      }
+      catch (const std::exception& e)
+      {
+        handle_rpc_exception(std::current_exception(), er, WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR);
+        return false;
+      }
+    }
     std::string wallet_file = m_wallet_dir + "/" + req.filename;
     {
       po::options_description desc("dummy");
@@ -3027,6 +3060,16 @@ namespace tools
     }
 
     if (m_wallet)
+      delete m_wallet;
+    m_wallet = wal.release();
+    return true;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  bool wallet_rpc_server::on_close_wallet(const wallet_rpc::COMMAND_RPC_CLOSE_WALLET::request& req, wallet_rpc::COMMAND_RPC_CLOSE_WALLET::response& res, epee::json_rpc::error& er, const connection_context *ctx)
+  {
+    if (!m_wallet) return not_open(er);
+
+    if (req.autosave_current)
     {
       try
       {
@@ -3037,24 +3080,6 @@ namespace tools
         handle_rpc_exception(std::current_exception(), er, WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR);
         return false;
       }
-      delete m_wallet;
-    }
-    m_wallet = wal.release();
-    return true;
-  }
-  //------------------------------------------------------------------------------------------------------------------------------
-  bool wallet_rpc_server::on_close_wallet(const wallet_rpc::COMMAND_RPC_CLOSE_WALLET::request& req, wallet_rpc::COMMAND_RPC_CLOSE_WALLET::response& res, epee::json_rpc::error& er, const connection_context *ctx)
-  {
-    if (!m_wallet) return not_open(er);
-
-    try
-    {
-      m_wallet->store();
-    }
-    catch (const std::exception& e)
-    {
-      handle_rpc_exception(std::current_exception(), er, WALLET_RPC_ERROR_CODE_UNKNOWN_ERROR);
-      return false;
     }
     delete m_wallet;
     m_wallet = NULL;

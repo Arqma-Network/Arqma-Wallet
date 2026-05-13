@@ -37,7 +37,6 @@
 #include <boost/serialization/set.hpp>
 #include <boost/serialization/map.hpp>
 #include <boost/serialization/is_bitwise_serializable.hpp>
-#include <boost/archive/binary_iarchive.hpp>
 #include <boost/archive/portable_binary_iarchive.hpp>
 #include <boost/archive/portable_binary_oarchive.hpp>
 #include "cryptonote_basic.h"
@@ -88,6 +87,12 @@ namespace boost
   inline void serialize(Archive &a, crypto::hash8 &x, const boost::serialization::version_type ver)
   {
     a & reinterpret_cast<char (&)[sizeof(crypto::hash8)]>(x);
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, crypto::hash4 &x, const boost::serialization::version_type ver)
+  {
+    a & reinterpret_cast<char (&)[sizeof(x.data)]>(x.data);
   }
 
   template <class Archive>
@@ -200,6 +205,27 @@ namespace boost
   }
 
   template <class Archive>
+  inline void serialize(Archive &a, cryptonote::pulse_random_value &x, const boost::serialization::version_type ver)
+  {
+    a & reinterpret_cast<char (&)[sizeof(x.data)]>(x.data);
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::pulse_header &x, const boost::serialization::version_type ver)
+  {
+    a & x.random_value;
+    a & x.round;
+    a & x.validator_bitset;
+  }
+
+  template <class Archive>
+  inline void serialize(Archive &a, cryptonote::pulse_validator_signature_entry &x, const boost::serialization::version_type ver)
+  {
+    a & x.voter_index;
+    a & x.signature;
+  }
+
+  template <class Archive>
   inline void serialize(Archive &a, cryptonote::block &b, const boost::serialization::version_type ver)
   {
     a & b.major_version;
@@ -207,9 +233,17 @@ namespace boost
     a & b.timestamp;
     a & b.prev_id;
     a & b.nonce;
+    if (b.major_version >= cryptonote::network_version_20)
+    {
+      a & b.pulse;
+      a & b.reward;
+      a & b.sn_winner_tail;
+    }
     //------------------
     a & b.miner_tx;
     a & b.tx_hashes;
+    if (b.major_version >= cryptonote::network_version_20)
+      a & b.pulse_validator_signatures;
   }
 
   template <class Archive>

@@ -71,6 +71,7 @@ extern "C" {
 #include "cryptonote_protocol/arqnet.h"
 
 #include "config/ascii.h"
+#include "common/arqma_pulse_fork.h"
 
 #undef ARQMA_DEFAULT_LOG_CATEGORY
 #define ARQMA_DEFAULT_LOG_CATEGORY "cn"
@@ -240,6 +241,13 @@ namespace cryptonote
   void *(*arqnet_new)(core &, const std::string &bind);
   void (*arqnet_delete)(void *&self);
   void (*arqnet_relay_obligation_votes)(void *self, const std::vector<service_nodes::quorum_vote_t> &);
+  bool (*arqnet_pulse_vote_buffer_copy)(
+      void *self,
+      crypto::hash const &block_hash,
+      uint64_t *block_height_out,
+      std::vector<pulse_validator_signature_entry> *out_entries) = nullptr;
+  void (*arqnet_pulse_vote_buffer_clear)(void *self, crypto::hash const &block_hash) = nullptr;
+  size_t (*arqnet_pulse_vote_buffer_distinct_block_count)(void *self) = nullptr;
   static bool init_core_callback_stubs()
   {
     arqnet_new = [](core &, const std::string &) -> void * { need_core_init(); };
@@ -714,9 +722,10 @@ namespace cryptonote
       MERROR("Failed to parse reorg notify spec");
     }
 
-    const std::vector<std::pair<uint8_t, uint64_t>> regtest_hard_forks = {std::make_pair(cryptonote::network_version_count - 1, 1)};
+    const std::vector<std::pair<uint8_t, uint64_t>> regtest_hard_forks = {std::make_pair(cryptonote::network_version_19, 1)};
     const cryptonote::test_options regtest_test_options = {
-      regtest_hard_forks
+        regtest_hard_forks,
+        0,
     };
 
     // SN
@@ -1501,6 +1510,42 @@ namespace cryptonote
     return m_blockchain_storage.create_block_template(b, prev_block, adr, diffic, height, expected_reward, ex_nonce, seed_height, seed_hash);
   }
   //-----------------------------------------------------------------------------------------------
+  bool core::get_pulse_block_template(
+      block &b,
+      service_nodes::block_winner const &pulse_producer,
+      uint8_t pulse_round,
+      uint16_t validator_bitset,
+      uint64_t &height,
+      uint64_t &expected_reward,
+      uint64_t &seed_height,
+      crypto::hash &seed_hash)
+  {
+    return m_blockchain_storage.create_next_pulse_block_template(
+        b, pulse_producer, pulse_round, validator_bitset, height, expected_reward, seed_height, seed_hash);
+  }
+  //-----------------------------------------------------------------------------------------------
+  bool core::copy_pulse_arqnet_vote_accumulator(
+      crypto::hash const &block_hash, uint64_t &block_height_out, std::vector<pulse_validator_signature_entry> &out_entries) const
+  {
+    if (!m_arqnet_obj || !arqnet_pulse_vote_buffer_copy)
+      return false;
+    return arqnet_pulse_vote_buffer_copy(m_arqnet_obj, block_hash, &block_height_out, &out_entries);
+  }
+  //-----------------------------------------------------------------------------------------------
+  void core::clear_pulse_arqnet_vote_accumulator(crypto::hash const &block_hash)
+  {
+    if (!m_arqnet_obj || !arqnet_pulse_vote_buffer_clear)
+      return;
+    arqnet_pulse_vote_buffer_clear(m_arqnet_obj, block_hash);
+  }
+  //-----------------------------------------------------------------------------------------------
+  size_t core::get_pulse_arqnet_vote_buffer_distinct_block_count() const
+  {
+    if (!m_arqnet_obj || !arqnet_pulse_vote_buffer_distinct_block_count)
+      return 0;
+    return arqnet_pulse_vote_buffer_distinct_block_count(m_arqnet_obj);
+  }
+  //-----------------------------------------------------------------------------------------------
   bool core::find_blockchain_supplement(const std::list<crypto::hash>& qblock_ids, NOTIFY_RESPONSE_CHAIN_ENTRY::request& resp) const
   {
     return m_blockchain_storage.find_blockchain_supplement(qblock_ids, resp);
@@ -1627,6 +1672,11 @@ namespace cryptonote
     if (result)
     {
       relay_service_node_votes(); // NOTE: not working while syncing.
+      if (b.major_version >= network_version_20)
+      {
+        crypto::hash const block_id = get_block_hash(b);
+        clear_pulse_arqnet_vote_accumulator(block_id);
+      }
     }
     return result;
   }
@@ -1808,6 +1858,25 @@ namespace cryptonote
         MGINFO_GREEN(ENDL << main_message_true << ENDL);
       else
         MGINFO_GREEN(ENDL << main_message_false << ENDL);
+
+#if ARQMA_ANNOUNCE_PLANNED_POS_TRANSITION
+      if (!arqma::pulse_fork::fork_active(m_nettype))
+      {
+        MGINFO_GREEN(ENDL << arqma::pulse_fork::NOTICE_LOG << ENDL);
+        if (m_service_node_keys)
+          MGINFO_CYAN(arqma::pulse_fork::SN_POS_STORAGE_PAIRING_HINT << ENDL);
+      }
+      else
+      {
+        const uint64_t fh = arqma::pulse_fork::planned_fork_height_for_net(m_nettype);
+        MGINFO_CYAN(
+            "PoW/PoS Hybrid consensus is active (HF network_version="
+            << static_cast<unsigned>(cryptonote::network_version_20) << " from height " << fh << ")."
+            << ENDL);
+        if (m_service_node_keys)
+          MGINFO_CYAN(arqma::pulse_fork::SN_POS_STORAGE_PAIRING_HINT << ENDL);
+      }
+#endif
 
       m_starter_message_showed = true;
     }

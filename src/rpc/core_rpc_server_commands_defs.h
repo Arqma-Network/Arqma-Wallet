@@ -703,6 +703,24 @@ namespace cryptonote
       std::string version;
       bool syncing;
 
+      /** PoW/PoS Hybrid telemetry: true when daemon applies hybrid consensus rules for this network (e.g. stagenet). */
+      bool pos_fork_active;
+      std::string pos_planned_hf_name;
+      uint64_t pos_planned_fork_height;
+      uint64_t pos_target_block_time_sec;
+      uint64_t pos_quorum_validators_min;
+      uint64_t pos_signature_threshold;
+      /** Pulse slots in hybrid: service validators still need paired arqma-storage-server (RFC storage_server_ping). */
+      bool pos_expects_sn_storage_server;
+      /** When FORK_ACTIVE and height beyond pos_planned_fork_height: elapsed canonical blocks past that rehearsal height (0 otherwise). */
+      uint64_t pos_pulse_blocks_since_fork;
+      /** Tooling hint: suggested pulse.round (height mod 256) for producer UX only; daemon does not enforce. */
+      uint64_t pos_pulse_next_round_wire_hint;
+      /** True when the next block cumulative-difficulty step uses next_difficulty_pulse_pos (60s LWMA) vs pre-PoS v16. */
+      bool pos_pulse_cum_diff_uses_60s_lwma;
+      /** Distinct block hashes in the in-process arqnet **`pulse_vote`** accumulator (0–64); 0 when restricted or arqnet unwired. */
+      uint64_t pos_pulse_arqnet_vote_buffer_blocks;
+
       BEGIN_KV_SERIALIZE_MAP()
         KV_SERIALIZE(status)
         KV_SERIALIZE(height)
@@ -742,6 +760,17 @@ namespace cryptonote
         KV_SERIALIZE(update_available)
         KV_SERIALIZE(version)
         KV_SERIALIZE(syncing)
+        KV_SERIALIZE(pos_fork_active)
+        KV_SERIALIZE(pos_planned_hf_name)
+        KV_SERIALIZE(pos_planned_fork_height)
+        KV_SERIALIZE(pos_target_block_time_sec)
+        KV_SERIALIZE(pos_quorum_validators_min)
+        KV_SERIALIZE(pos_signature_threshold)
+        KV_SERIALIZE(pos_expects_sn_storage_server)
+        KV_SERIALIZE(pos_pulse_blocks_since_fork)
+        KV_SERIALIZE(pos_pulse_next_round_wire_hint)
+        KV_SERIALIZE(pos_pulse_cum_diff_uses_60s_lwma)
+        KV_SERIALIZE(pos_pulse_arqnet_vote_buffer_blocks)
       END_KV_SERIALIZE_MAP()
     };
     typedef epee::misc_utils::struct_init<response_t> response;
@@ -926,6 +955,121 @@ namespace cryptonote
         KV_SERIALIZE(blockhashing_blob)
         KV_SERIALIZE(seed_hash)
         KV_SERIALIZE(next_seed_hash)
+        KV_SERIALIZE(status)
+        KV_SERIALIZE(untrusted)
+      END_KV_SERIALIZE_MAP()
+    };
+    typedef epee::misc_utils::struct_init<response_t> response;
+  };
+
+  /** Pulse-slot block template (PoW/PoS Hybrid main chain tip). Uses `core::get_pulse_block_template` with `service_node_list::get_block_winner()`. */
+  struct COMMAND_RPC_GET_PULSE_BLOCK_TEMPLATE
+  {
+    struct request_t
+    {
+      /** Pulse round index 0–255 (must match `convert_time_to_round` for the block). */
+      uint64_t pulse_round;
+      /** Validator participation bitset for the round (16-bit on wire). */
+      uint64_t validator_bitset;
+      /** Optional hex-encoded service-node **service** pubkey; if non-empty, templates coinbase for this active SN instead of `get_block_winner()`. */
+      std::string producer_pubkey;
+      /** Optional: 32 hex chars = 16-byte `pulse_header.random_value` (binds block hash before merge; must match the proposal peers voted on). */
+      std::string pulse_random_value;
+      /** If true, fill `pulse_validator_signatures` from the in-process arqnet vote accumulator for `get_block_hash(b)` (after optional random binding). */
+      bool merge_arqnet_votes;
+
+      BEGIN_KV_SERIALIZE_MAP()
+        KV_SERIALIZE(pulse_round)
+        KV_SERIALIZE(validator_bitset)
+        KV_SERIALIZE(producer_pubkey)
+        KV_SERIALIZE_OPT(pulse_random_value, (std::string) "")
+        KV_SERIALIZE_OPT(merge_arqnet_votes, false)
+      END_KV_SERIALIZE_MAP()
+    };
+    typedef epee::misc_utils::struct_init<request_t> request;
+
+    struct response_t
+    {
+      uint64_t difficulty;
+      uint64_t height;
+      uint64_t expected_reward;
+      std::string prev_hash;
+      uint64_t seed_height;
+      std::string seed_hash;
+      std::string next_seed_hash;
+      std::string blocktemplate_blob;
+      std::string blockhashing_blob;
+      /** `get_block_hash(b)` for the returned template (hex); quorum votes on arqnet use this id. */
+      std::string pulse_template_block_hash;
+      /** Count of `pulse_validator_signature_entry` rows in the template blob after optional `merge_arqnet_votes`. */
+      uint64_t merged_arqnet_vote_count;
+      /** Consensus quorum signature floor when `FORK_ACTIVE` (same as `arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD`). */
+      uint64_t pulse_signature_threshold;
+      /** True iff `merged_arqnet_vote_count >= pulse_signature_threshold` for this template blob. */
+      bool merged_pulse_signatures_meet_threshold;
+      std::string status;
+      bool untrusted;
+
+      BEGIN_KV_SERIALIZE_MAP()
+        KV_SERIALIZE(difficulty)
+        KV_SERIALIZE(height)
+        KV_SERIALIZE(expected_reward)
+        KV_SERIALIZE(prev_hash)
+        KV_SERIALIZE(seed_height)
+        KV_SERIALIZE(blocktemplate_blob)
+        KV_SERIALIZE(blockhashing_blob)
+        KV_SERIALIZE(pulse_template_block_hash)
+        KV_SERIALIZE(merged_arqnet_vote_count)
+        KV_SERIALIZE(pulse_signature_threshold)
+        KV_SERIALIZE(merged_pulse_signatures_meet_threshold)
+        KV_SERIALIZE(seed_hash)
+        KV_SERIALIZE(next_seed_hash)
+        KV_SERIALIZE(status)
+        KV_SERIALIZE(untrusted)
+      END_KV_SERIALIZE_MAP()
+    };
+    typedef epee::misc_utils::struct_init<response_t> response;
+  };
+
+  /** Pulse quorum votes received via arqnet for a proposed block hash (in-process buffer; tooling / producer). */
+  struct COMMAND_RPC_GET_PULSE_ARQNET_VOTES
+  {
+    struct request_t
+    {
+      /** 64 hex chars = `crypto::hash` of the proposed Pulse block. */
+      std::string block_hash;
+
+      BEGIN_KV_SERIALIZE_MAP()
+        KV_SERIALIZE(block_hash)
+      END_KV_SERIALIZE_MAP()
+    };
+    typedef epee::misc_utils::struct_init<request_t> request;
+
+    struct vote_row
+    {
+      uint64_t voter_index;
+      std::string signature;
+
+      BEGIN_KV_SERIALIZE_MAP()
+        KV_SERIALIZE(voter_index)
+        KV_SERIALIZE(signature)
+      END_KV_SERIALIZE_MAP()
+    };
+
+    struct response_t
+    {
+      bool found;
+      uint64_t chain_height;
+      std::string block_hash;
+      std::vector<vote_row> votes;
+      std::string status;
+      bool untrusted;
+
+      BEGIN_KV_SERIALIZE_MAP()
+        KV_SERIALIZE(found)
+        KV_SERIALIZE(chain_height)
+        KV_SERIALIZE(block_hash)
+        KV_SERIALIZE(votes)
         KV_SERIALIZE(status)
         KV_SERIALIZE(untrusted)
       END_KV_SERIALIZE_MAP()

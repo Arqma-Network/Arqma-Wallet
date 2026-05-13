@@ -292,6 +292,15 @@ namespace service_nodes
     bool alt_block_added(const cryptonote::block& block, const std::vector<cryptonote::transaction>& txs, cryptonote::checkpoint_t const *checkpoint) override;
     block_winner get_block_winner() const { std::lock_guard lock{m_sn_mutex}; return m_state.get_block_winner(); }
 
+    /**
+     * Builds the same coinbase payout split as for the scheduled winner, but for \p sn_service_pubkey if it is registered and **active**.
+     * Used for Pulse template RPC when the round elects a producer that is not necessarily the current `get_block_winner()` pubkey.
+     *
+     * @note When `FORK_ACTIVE` and HF is PoS-major, `validate_miner_tx` accepts the coinbase winner if it is an **active** SN on the
+     *        **checkpointing quorum** (validators or workers) at `height - 1`, not only the scheduled `get_block_winner()` pubkey.
+     */
+    bool try_get_block_winner_for_service_node(crypto::public_key const &sn_service_pubkey, block_winner &out) const;
+
     bool is_service_node(const crypto::public_key& pubkey, bool require_cative = true) const;
     bool is_key_image_locked(crypto::key_image const &check_image, uint64_t *unlock_height = nullptr, service_node_info::contribution_t *the_locked_contribution = nullptr) const;
 
@@ -299,6 +308,8 @@ namespace service_nodes
     bool get_quorum_pubkey(quorum_type type, quorum_group group, uint64_t height, size_t quorum_size, crypto::public_key &key) const;
 
     size_t get_service_node_count() const;
+    /** Active SN only (registered and `is_active()`); used for hybrid PoW difficulty scaling. */
+    size_t get_active_service_node_count() const;
     std::vector<service_node_pubkey_info> get_service_node_list_state(const std::vector<crypto::public_key> &service_node_pubkeys = {}) const;
     const std::vector<key_image_blacklist_entry> &get_blacklisted_key_images() const { return m_state.key_image_blacklist; }
 

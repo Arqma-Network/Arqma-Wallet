@@ -36,6 +36,7 @@
 #include <vector>
 #include <list>
 #include <set>
+#include <cstdint>
 #include <ctime>
 #include <iostream>
 #include <stdexcept>
@@ -815,6 +816,25 @@ struct Wallet
      */
     virtual void disposeTransaction(PendingTransaction * t) = 0;
 
+    /*!
+     * \brief exportPendingRelaySlices - serialize each pending sub-tx for relay_tx (do_not_relay path).
+     * \return false if \a t is not a PendingTransactionImpl or serialization fails.
+     */
+    virtual bool exportPendingRelaySlices(
+        PendingTransaction * t,
+        std::vector<std::string> &hexes_out,
+        std::vector<uint64_t> &fees_out
+    ) = 0;
+
+    /*!
+     * \brief relayTxFromMetadataHex - submit a transaction from hex metadata (portable_binary
+     *        serialized tools::wallet2::pending_tx), same semantics as wallet RPC relay_tx.
+     * \param metadata_hex hex from transfer / transfer_split with do_not_relay
+     * \param tx_hash_out transaction id on success
+     * \return true on success
+     */
+    virtual bool relayTxFromMetadataHex(const std::string &metadata_hex, std::string &tx_hash_out) = 0;
+
    /*!
     * \brief exportKeyImages - exports key images to file
     * \param filename
@@ -952,6 +972,24 @@ struct Wallet
     virtual Device getDeviceType() const = 0;
 
     virtual PendingTransaction* stakePending(const std::string& service_node_key, const std::string& amount, std::string& error_msg) = 0;
+};
+
+/**
+ * @brief PoW/PoS Hybrid subset of daemon `get_info` for wallet-manager consumers (single query via \ref WalletManagerBase::daemonPosInfo).
+ */
+struct DaemonPosInfo
+{
+    bool pos_fork_active = false;
+    std::string pos_planned_hf_name;
+    uint64_t pos_planned_fork_height = 0;
+    uint64_t pos_target_block_time_sec = 0;
+    uint64_t pos_quorum_validators_min = 0;
+    uint64_t pos_signature_threshold = 0;
+    bool pos_expects_sn_storage_server = false;
+    uint64_t pos_pulse_blocks_since_fork = 0;
+    uint64_t pos_pulse_next_round_wire_hint = 0;
+    bool pos_pulse_cum_diff_uses_60s_lwma = false;
+    uint64_t pos_pulse_arqnet_vote_buffer_blocks = 0;
 };
 
 /**
@@ -1183,11 +1221,14 @@ struct WalletManagerBase
     //! returns true iff mining
     virtual bool isMining() = 0;
 
-    //! starts mining with the set number of threads
+    //! starts mining with the set number of threads. On failure, \ref errorString() is set (daemon `status`, e.g. PoW/PoS Hybrid Pulse slot PoW unavailable, or transport error).
     virtual bool startMining(const std::string &address, uint32_t threads = 1) = 0;
 
-    //! stops mining
+    //! stops mining. On failure, \ref errorString() carries the daemon `status` when available.
     virtual bool stopMining() = 0;
+
+    //! Fills \p info from daemon `get_info` PoW/PoS Hybrid fields (one HTTP round-trip). On failure returns false and sets \ref errorString().
+    virtual bool daemonPosInfo(DaemonPosInfo &info) = 0;
 
     //! resolves an OpenAlias address to a monero address
     virtual std::string resolveOpenAlias(const std::string &address, bool &dnssec_valid) const = 0;

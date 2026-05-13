@@ -31,6 +31,7 @@
 #include <cstdio>
 
 #include "common/arqma.h"
+#include "common/arqma_pulse_fork.h"
 #include "cryptonote_basic/cryptonote_basic.h"
 #include "blockchain_db/blockchain_db.h"
 #include "hardfork.h"
@@ -72,6 +73,9 @@ static constexpr HardFork::Params mainnet_hard_forks[] =
   { network_version_17, 1760751, 0, 1754410575 },
   { network_version_18, 1863160, 0, 1768160647 },
   { network_version_19, 1886030, 0, 1771099200 }
+
+  // Planned PoW/PoS Hybrid HF (inactive until uncommented):
+  // { network_version_20, 2000000, 0, TBD_UNIX_TIME },
 };
 
 static constexpr HardFork::Params testnet_hard_forks[] =
@@ -91,6 +95,14 @@ static constexpr HardFork::Params testnet_hard_forks[] =
   { network_version_18,   1100, 0, 1566598282 }
 };
 
+// ------------------------------------------------------------------------------
+// HF ARQMA-V11.0.0-PoW-PoS-Hybrid: stagenet row is active in stagenet_hard_forks[] (height from
+// arqma::pulse_fork::STAGENET_FORK_HEIGHT_PLANNED). MAINNET v20 stays commented until governance + timestamps.
+//
+// cryptonote::network_version_20, target block time 60s, quorum min 10 / threshold 7 signatures.
+// MAINNET planned height (user spec): 2000000 — keep row below commented until go-live.
+// ------------------------------------------------------------------------------
+
 static constexpr HardFork::Params stagenet_hard_forks[] =
 {
   { network_version_1,       0, 0, 1341378000 },
@@ -106,7 +118,9 @@ static constexpr HardFork::Params stagenet_hard_forks[] =
   { network_version_16,    160, 0, 1570414510 },
   { network_version_17,    180, 0, 1570414511 },
   { network_version_18,    200, 0, 1570414512 },
-  { network_version_19,    220, 0, 1570414513 }
+  { network_version_19,    220, 0, 1570414513 },
+  /** Stagenet hybrid PoW/Pulse (alternate slots by height): mainnet v20 remains commented below until go-live. */
+  { cryptonote::network_version_20, arqma::pulse_fork::STAGENET_FORK_HEIGHT_PLANNED, 0, 1735689600 }
 };
 
 uint64_t HardFork::get_hardcoded_hard_fork_height(network_type nettype, cryptonote::network_version version)
@@ -130,6 +144,21 @@ HardFork::ParamsIterator HardFork::get_hardcoded_hard_forks(network_type nettype
   else if (nettype == TESTNET) return {testnet_hard_forks, std::end(testnet_hard_forks)};
   else if (nettype == STAGENET) return {stagenet_hard_forks, std::end(stagenet_hard_forks)};
   return {nullptr, nullptr};
+}
+
+bool HardFork::hard_fork_table_includes_pulse_hybrid(network_type nettype)
+{
+  ParamsIterator const it = get_hardcoded_hard_forks(nettype);
+  Params const *const b = it.begin();
+  Params const *const e = it.end();
+  if (b == nullptr || e == nullptr || b >= e)
+    return false;
+  for (Params const *p = b; p != e; ++p)
+  {
+    if (p->version >= network_version_20)
+      return true;
+  }
+  return false;
 }
 
 HardFork::HardFork(cryptonote::BlockchainDB &db, uint8_t original_version, std::chrono::seconds forked_time, uint64_t window_size, uint8_t default_threshold_percent):

@@ -29,6 +29,7 @@
 
 #include "json_object.h"
 
+#include <cstring>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/variant/apply_visitor.hpp>
 #include <limits>
@@ -271,6 +272,73 @@ void fromJsonValue(const rapidjson::Value& val, cryptonote::transaction& tx)
     throw BAD_INPUT();
 }
 
+void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const crypto::hash4& h)
+{
+  const std::string blob(h.data, sizeof(h.data));
+  toJsonValue(dest, boost::string_ref{epee::string_tools::buff_to_hex_nodelimer(blob)});
+}
+
+void fromJsonValue(const rapidjson::Value& val, crypto::hash4& h)
+{
+  if (!val.IsString())
+    throw WRONG_TYPE("string");
+  std::string bin;
+  if (!epee::string_tools::parse_hexstr_to_binbuff(val.GetString(), bin) || bin.size() != sizeof(h.data))
+    throw BAD_INPUT();
+  std::memcpy(h.data, bin.data(), sizeof(h.data));
+}
+
+void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const cryptonote::pulse_random_value& v)
+{
+  const std::string blob(reinterpret_cast<const char*>(v.data), sizeof(v.data));
+  toJsonValue(dest, boost::string_ref{epee::string_tools::buff_to_hex_nodelimer(blob)});
+}
+
+void fromJsonValue(const rapidjson::Value& val, cryptonote::pulse_random_value& v)
+{
+  if (!val.IsString())
+    throw WRONG_TYPE("string");
+  std::string bin;
+  if (!epee::string_tools::parse_hexstr_to_binbuff(val.GetString(), bin) || bin.size() != sizeof(v.data))
+    throw BAD_INPUT();
+  std::memcpy(v.data, bin.data(), sizeof(v.data));
+}
+
+void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const cryptonote::pulse_header& p)
+{
+  dest.StartObject();
+  INSERT_INTO_JSON_OBJECT(dest, random_value, p.random_value);
+  INSERT_INTO_JSON_OBJECT(dest, round, p.round);
+  INSERT_INTO_JSON_OBJECT(dest, validator_bitset, p.validator_bitset);
+  dest.EndObject();
+}
+
+void fromJsonValue(const rapidjson::Value& val, cryptonote::pulse_header& p)
+{
+  if (!val.IsObject())
+    throw WRONG_TYPE("json object");
+  GET_FROM_JSON_OBJECT(val, p.random_value, random_value);
+  GET_FROM_JSON_OBJECT(val, p.round, round);
+  GET_FROM_JSON_OBJECT(val, p.validator_bitset, validator_bitset);
+}
+
+void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const cryptonote::pulse_validator_signature_entry& e)
+{
+  dest.StartObject();
+  INSERT_INTO_JSON_OBJECT(dest, voter_index, e.voter_index);
+  INSERT_INTO_JSON_OBJECT(dest, signature, e.signature);
+  dest.EndObject();
+}
+
+void fromJsonValue(const rapidjson::Value& val, cryptonote::pulse_validator_signature_entry& e)
+{
+  if (!val.IsObject())
+    throw WRONG_TYPE("json object");
+  memset(e.padding, 0, sizeof(e.padding));
+  GET_FROM_JSON_OBJECT(val, e.voter_index, voter_index);
+  GET_FROM_JSON_OBJECT(val, e.signature, signature);
+}
+
 void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const cryptonote::block& b)
 {
   dest.StartObject();
@@ -280,6 +348,15 @@ void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const crypton
   INSERT_INTO_JSON_OBJECT(dest, timestamp, b.timestamp);
   INSERT_INTO_JSON_OBJECT(dest, prev_id, b.prev_id);
   INSERT_INTO_JSON_OBJECT(dest, nonce, b.nonce);
+
+  if (b.major_version >= cryptonote::network_version_20)
+  {
+    INSERT_INTO_JSON_OBJECT(dest, pulse, b.pulse);
+    INSERT_INTO_JSON_OBJECT(dest, reward, b.reward);
+    INSERT_INTO_JSON_OBJECT(dest, sn_winner_tail, b.sn_winner_tail);
+    INSERT_INTO_JSON_OBJECT(dest, pulse_validator_signatures, b.pulse_validator_signatures);
+  }
+
   INSERT_INTO_JSON_OBJECT(dest, miner_tx, b.miner_tx);
   INSERT_INTO_JSON_OBJECT(dest, tx_hashes, b.tx_hashes);
 
@@ -299,6 +376,24 @@ void fromJsonValue(const rapidjson::Value& val, cryptonote::block& b)
   GET_FROM_JSON_OBJECT(val, b.timestamp, timestamp);
   GET_FROM_JSON_OBJECT(val, b.prev_id, prev_id);
   GET_FROM_JSON_OBJECT(val, b.nonce, nonce);
+
+  b.pulse = {};
+  b.reward = 0;
+  b.sn_winner_tail = crypto::null_hash4;
+  b.pulse_validator_signatures.clear();
+
+  if (b.major_version >= cryptonote::network_version_20)
+  {
+    if (val.HasMember("pulse"))
+      fromJsonValue(val["pulse"], b.pulse);
+    if (val.HasMember("reward"))
+      fromJsonValue(val["reward"], b.reward);
+    if (val.HasMember("sn_winner_tail"))
+      fromJsonValue(val["sn_winner_tail"], b.sn_winner_tail);
+    if (val.HasMember("pulse_validator_signatures"))
+      fromJsonValue(val["pulse_validator_signatures"], b.pulse_validator_signatures);
+  }
+
   GET_FROM_JSON_OBJECT(val, b.miner_tx, miner_tx);
   GET_FROM_JSON_OBJECT(val, b.tx_hashes, tx_hashes);
 }
@@ -1325,6 +1420,17 @@ void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const crypton
   INSERT_INTO_JSON_OBJECT(dest, block_size_median, info.block_size_median);
   INSERT_INTO_JSON_OBJECT(dest, block_weight_median, info.block_weight_median);
   INSERT_INTO_JSON_OBJECT(dest, start_time, info.start_time);
+  INSERT_INTO_JSON_OBJECT(dest, pos_fork_active, info.pos_fork_active);
+  INSERT_INTO_JSON_OBJECT(dest, pos_planned_hf_name, info.pos_planned_hf_name);
+  INSERT_INTO_JSON_OBJECT(dest, pos_planned_fork_height, info.pos_planned_fork_height);
+  INSERT_INTO_JSON_OBJECT(dest, pos_target_block_time_sec, info.pos_target_block_time_sec);
+  INSERT_INTO_JSON_OBJECT(dest, pos_quorum_validators_min, info.pos_quorum_validators_min);
+  INSERT_INTO_JSON_OBJECT(dest, pos_signature_threshold, info.pos_signature_threshold);
+  INSERT_INTO_JSON_OBJECT(dest, pos_expects_sn_storage_server, info.pos_expects_sn_storage_server);
+  INSERT_INTO_JSON_OBJECT(dest, pos_pulse_blocks_since_fork, info.pos_pulse_blocks_since_fork);
+  INSERT_INTO_JSON_OBJECT(dest, pos_pulse_next_round_wire_hint, info.pos_pulse_next_round_wire_hint);
+  INSERT_INTO_JSON_OBJECT(dest, pos_pulse_cum_diff_uses_60s_lwma, info.pos_pulse_cum_diff_uses_60s_lwma);
+  INSERT_INTO_JSON_OBJECT(dest, pos_pulse_arqnet_vote_buffer_blocks, info.pos_pulse_arqnet_vote_buffer_blocks);
 
   dest.EndObject();
 }
@@ -1335,6 +1441,18 @@ void fromJsonValue(const rapidjson::Value& val, cryptonote::rpc::DaemonInfo& inf
   {
     throw WRONG_TYPE("json object");
   }
+
+  info.pos_fork_active = false;
+  info.pos_planned_hf_name.clear();
+  info.pos_planned_fork_height = 0;
+  info.pos_target_block_time_sec = 0;
+  info.pos_quorum_validators_min = 0;
+  info.pos_signature_threshold = 0;
+  info.pos_expects_sn_storage_server = false;
+  info.pos_pulse_blocks_since_fork = 0;
+  info.pos_pulse_next_round_wire_hint = 0;
+  info.pos_pulse_cum_diff_uses_60s_lwma = false;
+  info.pos_pulse_arqnet_vote_buffer_blocks = 0;
 
   GET_FROM_JSON_OBJECT(val, info.height, height);
   GET_FROM_JSON_OBJECT(val, info.target_height, target_height);
@@ -1358,6 +1476,51 @@ void fromJsonValue(const rapidjson::Value& val, cryptonote::rpc::DaemonInfo& inf
   GET_FROM_JSON_OBJECT(val, info.block_size_median, block_size_median);
   GET_FROM_JSON_OBJECT(val, info.block_weight_median, block_weight_median);
   GET_FROM_JSON_OBJECT(val, info.start_time, start_time);
+
+  if (val.HasMember("pos_fork_active"))
+    fromJsonValue(val["pos_fork_active"], info.pos_fork_active);
+  else
+    info.pos_fork_active = false;
+
+  if (val.HasMember("pos_planned_hf_name"))
+    fromJsonValue(val["pos_planned_hf_name"], info.pos_planned_hf_name);
+
+  if (val.HasMember("pos_planned_fork_height"))
+    fromJsonValue(val["pos_planned_fork_height"], info.pos_planned_fork_height);
+
+  if (val.HasMember("pos_target_block_time_sec"))
+    fromJsonValue(val["pos_target_block_time_sec"], info.pos_target_block_time_sec);
+
+  if (val.HasMember("pos_quorum_validators_min"))
+    fromJsonValue(val["pos_quorum_validators_min"], info.pos_quorum_validators_min);
+
+  if (val.HasMember("pos_signature_threshold"))
+    fromJsonValue(val["pos_signature_threshold"], info.pos_signature_threshold);
+
+  if (val.HasMember("pos_expects_sn_storage_server"))
+    fromJsonValue(val["pos_expects_sn_storage_server"], info.pos_expects_sn_storage_server);
+  else
+    info.pos_expects_sn_storage_server = false;
+
+  if (val.HasMember("pos_pulse_blocks_since_fork"))
+    fromJsonValue(val["pos_pulse_blocks_since_fork"], info.pos_pulse_blocks_since_fork);
+  else
+    info.pos_pulse_blocks_since_fork = 0;
+
+  if (val.HasMember("pos_pulse_next_round_wire_hint"))
+    fromJsonValue(val["pos_pulse_next_round_wire_hint"], info.pos_pulse_next_round_wire_hint);
+  else
+    info.pos_pulse_next_round_wire_hint = 0;
+
+  if (val.HasMember("pos_pulse_cum_diff_uses_60s_lwma"))
+    fromJsonValue(val["pos_pulse_cum_diff_uses_60s_lwma"], info.pos_pulse_cum_diff_uses_60s_lwma);
+  else
+    info.pos_pulse_cum_diff_uses_60s_lwma = false;
+
+  if (val.HasMember("pos_pulse_arqnet_vote_buffer_blocks"))
+    fromJsonValue(val["pos_pulse_arqnet_vote_buffer_blocks"], info.pos_pulse_arqnet_vote_buffer_blocks);
+  else
+    info.pos_pulse_arqnet_vote_buffer_blocks = 0;
 }
 
 void toJsonValue(rapidjson::Writer<rapidjson::StringBuffer>& dest, const cryptonote::rpc::output_distribution& dist)

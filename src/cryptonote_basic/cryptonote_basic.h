@@ -38,7 +38,7 @@
 #include <sstream>
 #include <atomic>
 #include "serialization/variant.h"
-#include "serialization/vector.h"
+#include "serialization/containers.h"
 #include "serialization/binary_archive.h"
 #include "serialization/json_archive.h"
 #include "serialization/debug_archive.h"
@@ -359,6 +359,61 @@ namespace cryptonote
   };
 
   /************************************************************************/
+  /* Pulse/PoS (incremental Arqma wire format — PoS consensus slice).   */
+  /************************************************************************/
+
+  /** Serialized as 16 raw bytes (canonical Arqma pulse_random_value). */
+  struct pulse_random_value
+  {
+    unsigned char data[16]{};
+
+    bool operator==(pulse_random_value const& o) const noexcept
+    {
+      return std::memcmp(data, o.data, sizeof(data)) == 0;
+    }
+
+    template <bool W, template <bool> class Archive>
+    bool do_serialize(Archive<W>& ar)
+    {
+      ar.serialize_blob(data, sizeof(data));
+      return ar.stream().good();
+    }
+  };
+
+  struct pulse_header
+  {
+    pulse_random_value random_value{};
+    uint8_t round{0};
+    /** Participation mask for validator indices 0..15; see Blockchain::verify_pulse_fork_block_rules. */
+    uint16_t validator_bitset{0};
+
+    bool empty() const noexcept
+    {
+      static constexpr pulse_random_value zero{};
+      return validator_bitset == 0 && random_value == zero;
+    }
+
+    BEGIN_SERIALIZE()
+      FIELD(random_value)
+      FIELD(round)
+      FIELD(validator_bitset)
+    END_SERIALIZE()
+  };
+
+  /** One Pulse quorum validator vote on the block (quorum_signature-compatible on wire for Arqma Pulse). */
+  struct pulse_validator_signature_entry
+  {
+    uint16_t voter_index{0};
+    uint8_t padding[6]{};
+    crypto::signature signature;
+
+    BEGIN_SERIALIZE()
+      FIELD(voter_index)
+      FIELD(signature)
+    END_SERIALIZE()
+  };
+
+  /************************************************************************/
   /*                                                                      */
   /************************************************************************/
   struct block_header
@@ -368,6 +423,17 @@ namespace cryptonote
     uint64_t timestamp;
     crypto::hash prev_id;
     uint32_t nonce;
+    pulse_header pulse{};
+    /** Total Pulse/SN-side reward (+fees semantics TBD); varint after pulse; enters block hash preimage. */
+    uint64_t reward = 0;
+    /** Last 4 bytes of declared SN winner pubkey (sanity tie-in; not sole authority bit). */
+    crypto::hash4 sn_winner_tail{};
+
+    /** True when this block carries non-empty Pulse header fields (Pulse slot in PoW/PoS Hybrid once HF >= network_version_20). */
+    bool has_pulse_header_data() const noexcept
+    {
+      return major_version >= network_version_20 && !pulse.empty();
+    }
 
     BEGIN_SERIALIZE()
       VARINT_FIELD(major_version)
@@ -375,6 +441,12 @@ namespace cryptonote
       VARINT_FIELD(timestamp)
       FIELD(prev_id)
       FIELD(nonce)
+      if (major_version >= network_version_20)
+      {
+        FIELDS(pulse)
+        VARINT_FIELD(reward)
+        FIELD(sn_winner_tail)
+      }
     END_SERIALIZE()
   };
 
@@ -397,6 +469,14 @@ namespace cryptonote
 
     transaction miner_tx;
     std::vector<crypto::hash> tx_hashes;
+    std::vector<pulse_validator_signature_entry> pulse_validator_signatures;
+
+    /** Pulse metadata present (pulse header blob and/or validator signatures after tx_hashes). */
+    bool has_pulse() const noexcept
+    {
+      return major_version >= network_version_20
+          && (has_pulse_header_data() || !pulse_validator_signatures.empty());
+    }
 
     // hash cash
     mutable crypto::hash hash;
@@ -410,6 +490,13 @@ namespace cryptonote
       FIELD(tx_hashes)
       if(tx_hashes.size() > config::tx_settings::MAX_TRANSACTIONS_IN_BLOCK)
         return false;
+      if (major_version >= network_version_20)
+      {
+        FIELD(pulse_validator_signatures)
+        if (!typename Archive<W>::is_saving() &&
+            pulse_validator_signatures.size() > config::block_settings::MAX_PULSE_VALIDATOR_SIGNATURES)
+          return false;
+      }
     END_SERIALIZE()
   };
 

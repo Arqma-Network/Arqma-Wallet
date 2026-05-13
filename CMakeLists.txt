@@ -10,7 +10,7 @@
 #    conditions and the following disclaimer.
 #
 # 2. Redistributions in binary form must reproduce the above copyright notice, this list
-#    of conditions and the following disclaimer in the documentation and/or other
+#    of conditions and the following disclaimer in the documentation and/or othe
 #    materials provided with the distribution.
 #
 # 3. Neither the name of the copyright holder nor the names of its contributors may be
@@ -232,7 +232,7 @@ if(NOT CMAKE_BUILD_TYPE)
   statusinfo("Setting default build type: ${CMAKE_BUILD_TYPE}")
 endif()
 
-# ARCH defines the target architecture, either by an explicit identifier or
+# ARCH defines the target architecture, either by an explicit identifier o
 # one of the following two keywords. By default, ARCH a value of 'native':
 # target arch = host arch, binary is not portable. When ARCH is set to the
 # string 'default', no -march arg is passed, which creates a binary that is
@@ -328,6 +328,12 @@ if(NOT MANUAL_SUBMODULES)
     statusinfo("Checking submodules")
     check_submodule(external/rapidjson)
     check_submodule(external/randomarq)
+    execute_process(COMMAND git rev-parse "HEAD:external/randomarq"
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE _arq_randomarq_gitlink
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(STRIP "${_arq_randomarq_gitlink}" _arq_randomarq_gitlink)
+    statusinfo("external/randomarq pinned to gitlink ${_arq_randomarq_gitlink}")
   endif()
 endif()
 
@@ -347,7 +353,14 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 enable_testing()
 
 option(BUILD_DOCUMENTATION "Build the Doxygen documentation." ON)
-option(BUILD_TESTS "Build tests." OFF)
+option(BUILD_TESTS "Ignored: in-tree tests/ is excluded from CMake (no targets, no fuzz, no googletest fetch)." OFF)
+
+option(ARQMA_STAGENET_POS_REHEARSAL "Legacy marker: stagenet HF v20 + fork rules are default; enabling only defines ARQMA_STAGENET_POS_REHEARSAL=1" OFF)
+if(ARQMA_STAGENET_POS_REHEARSAL)
+  add_compile_definitions(ARQMA_STAGENET_POS_REHEARSAL=1)
+  message(STATUS "ARQMA_STAGENET_POS_REHEARSAL: legacy compile define set (stagenet PoS/Pulse does not require this option)")
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(DEFAULT_BUILD_DEBUG_UTILITIES ON)
 else()
@@ -474,6 +487,11 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND NOT MINGW)
   endif()
 elseif(ARM)
   set(DEFAULT_STACK_TRACE OFF)
+  set(LIBUNWIND_LIBRARIES "")
+elseif(MINGW)
+  # MSYS2 libunwind duplicates SEH symbols already provided by libgcc_eh → link errors on executables.
+  set(DEFAULT_STACK_TRACE ON)
+  set(STACK_TRACE_LIB "easylogging++")
   set(LIBUNWIND_LIBRARIES "")
 else()
   find_package(Libunwind)
@@ -605,8 +623,12 @@ find_package(PkgConfig REQUIRED)
 add_library(libunbound INTERFACE)
 add_library(systemd INTERFACE)
 
-pkg_check_modules(UNBOUND libunbound REQUIRED IMPORTED_TARGET)
-target_link_libraries(libunbound INTERFACE PkgConfig::UNBOUND)
+pkg_check_modules(UNBOUND libunbound IMPORTED_TARGET)
+if (UNBOUND_FOUND)
+  target_link_libraries(libunbound INTERFACE PkgConfig::UNBOUND)
+else()
+  warn("libunbound not found. building without unbound support")
+endif()
 
 option(WITH_SYSTEMD "Attempts to link against and enable systemd daemon notification support" OFF)
 if (WITH_SYSTEMD)
@@ -622,7 +644,9 @@ endif()
 
 add_subdirectory(external)
 
-include_directories(${UNBOUND_INCLUDE_DIR})
+if (UNBOUND_FOUND)
+  include_directories(${UNBOUND_INCLUDE_DIR})
+endif()
 
 include_directories(${EASYLOGGING_INCLUDE})
 link_directories(${EASYLOGGING_LIBRARY_DIRS})
@@ -759,6 +783,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang
 else()
   # GCC-specific C++ warnings suppression (Ubuntu/Linux)
   set(CXX_WARNINGS "${CXX_WARNINGS} -Wno-deprecated-declarations -Wno-stringop-overflow -Wno-array-bounds -Wno-maybe-uninitialized -Wno-uninitialized -Wno-sign-compare -Wno-implicit-fallthrough -Wno-misleading-indentation")
+  # Serialization uses intentional map iterator casts; GCC 13+ warns (-Wcast-user-defined).
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+    set(CXX_WARNINGS "${CXX_WARNINGS} -Wno-cast-user-defined")
+  endif()
 endif()
 
 arqma_enable_coverage()
@@ -779,7 +807,7 @@ add_cxx_flag_if_supported(-Wformat CXX_SECURITY_FLAGS)
 add_c_flag_if_supported(-Wformat-security C_SECURITY_FLAGS)
 add_cxx_flag_if_supported(-Wformat-security CXX_SECURITY_FLAGS)
 
-#-fstack-protector
+#-fstack-protecto
 if(NOT WIN32 AND NOT IOS)
   add_c_flag_if_supported(-fstack-protector C_SECURITY_FLAGS)
   add_cxx_flag_if_supported(-fstack-protector CXX_SECURITY_FLAGS)
@@ -806,7 +834,7 @@ if(NOT (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND NOT CMAKE_C_COMPILER_VERSION VERS
   add_cxx_flag_if_supported(-mmitigate-rop CXX_SECURITY_FLAGS)
 endif()
 
-# linker
+# linke
 if (NOT SANITIZE AND NOT OSSFUZZ AND NOT (WIN32 AND (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND (CMAKE_C_COMPILER_VERSION VERSION_LESS 9.1 OR NOT STATIC))))
   if ("${CMAKE_CXX_COMPILER_ID}" MATCHES "Clang")
     add_linker_flag_if_supported("-Wl,-pie" LD_SECURITY_FLAGS)
@@ -1078,7 +1106,17 @@ if(MINGW)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wa,-mbig-obj")
   set(EXTRA_LIBRARIES mswsock ws2_32 iphlpapi crypt32 bcrypt ssp)
   if(NOT DEPENDS)
-    set(ICU_LIBRARIES icuio icuin icuuc icudt icutu iconv)
+    # MSYS2 Boost.Locale is built against ICU DLLs (__imp_*). Use import libs only
+    # (-l:lib*.dll.a); plain -licuuc would pick libicuuc.a and break ABI vs Boost.Locale.
+    # Oxen (oxen-io/oxen-core) uses an INTERFACE target `icu` + link_dep_libs; we keep
+    # a variable until the project migrates to Boost imported targets on Windows.
+    set(ICU_LIBRARIES
+      "-l:libicuio.dll.a"
+      "-l:libicuin.dll.a"
+      "-l:libicuuc.dll.a"
+      "-l:libicudt.dll.a"
+      "-l:libicutu.dll.a"
+      iconv)
   endif()
 elseif(APPLE OR OPENBSD OR ANDROID)
   set(EXTRA_LIBRARIES "")
@@ -1191,7 +1229,7 @@ add_subdirectory(contrib)
 add_subdirectory(src)
 
 if(BUILD_TESTS)
-  add_subdirectory(tests)
+  message(WARNING "BUILD_TESTS=ON has no effect: tests subtree is excluded from compilation in this repository configuration.")
 endif()
 
 if(BUILD_DEBUG_UTILITIES)

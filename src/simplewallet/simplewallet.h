@@ -149,6 +149,7 @@ namespace cryptonote
     bool set_ignore_fractional_outputs(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_track_uses(const std::vector<std::string> &args = std::vector<std::string>());
     bool set_export_format(const std::vector<std::string> &args = std::vector<std::string>());
+    bool set_load_deprecated_formats(const std::vector<std::string> &args = std::vector<std::string>());
     bool help(const std::vector<std::string> &args = std::vector<std::string>());
     bool start_mining(const std::vector<std::string> &args);
     bool stop_mining(const std::vector<std::string> &args);
@@ -293,6 +294,9 @@ namespace cryptonote
     void commit_or_save(std::vector<tools::wallet2::pending_tx>& ptx_vector, bool do_not_relay);
 
     bool check_refresh();
+
+    //! If daemon `get_info` reports planned/active PoW/PoS Hybrid, print the same telemetry lines as `status`.
+    void maybe_print_daemon_pos_info();
 
     //----------------- i_wallet2_callback ---------------------
     virtual void on_new_block(uint64_t height, const cryptonote::block& block);

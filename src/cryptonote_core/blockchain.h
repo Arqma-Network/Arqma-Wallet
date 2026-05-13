@@ -365,6 +365,30 @@ namespace cryptonote
     bool create_block_template(block& b, const crypto::hash *from_block, const account_public_address& miner_address, difficulty_type& di, uint64_t& height, uint64_t& expected_reward, const std::string& ex_nonce, uint64_t &seed_height, crypto::hash &seed_hash);
 
     /**
+     * Main-chain Pulse template (oxen-style create_next_pulse_block_template): fills block from the pool and SN \p pulse_producer,
+     * sets pulse.round / pulse.validator_bitset, header reward + sn_winner_tail from the coinbase (random_value / signatures left unset).
+     */
+    bool create_next_pulse_block_template(
+        block &b,
+        service_nodes::block_winner const &pulse_producer,
+        uint8_t round,
+        uint16_t validator_bitset,
+        uint64_t &height,
+        uint64_t &expected_reward,
+        uint64_t &seed_height,
+        crypto::hash &seed_hash);
+
+    /**
+     * Pulse slots (PoW/PoS Hybrid): when fork_active(net) and block major_version >= network_version_20, validate pulse header,
+     * non-zero random preimage binding, validator_bitset vs signatures (bit i set requires a valid vote from validator i
+     * when i < 16; indices >= 16 only exist when checkpointing quorum size exceeds 16 and have no header bit), and enough
+     * valid checkpointing-validator signatures over the block hash.
+     * Called from service_node_list::block_added / alt_block_added after the block is accepted into the DB —
+     * same ordering as oxen-core (signatures checked in the SNL hook, not alongside PoW skipping).
+     */
+    bool verify_pulse_fork_block_rules(const cryptonote::block &bl, cryptonote::block_verification_context &bvc, const char *context) const;
+
+    /**
      * @brief checks if a block is known about with a given hash
      *
      * This function checks the main chain, alternate chains, and invalid blocks

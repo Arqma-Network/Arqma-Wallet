@@ -31,7 +31,9 @@
 
 #include <boost/preprocessor/stringize.hpp>
 #include <algorithm>
+#include <limits>
 #include <cstring>
+#include <chrono>
 #include <boost/filesystem.hpp>
 #include "include_base_utils.h"
 #include "string_tools.h"
@@ -42,13 +44,17 @@ using namespace epee;
 #include "common/updates.h"
 #include "common/download.h"
 #include "common/arqma.h"
+#include "common/arqma_pulse_fork.h"
 #include "common/util.h"
 #include "common/perf_timer.h"
 #include "common/random.h"
 #include "cryptonote_basic/cryptonote_format_utils.h"
+#include "cryptonote_basic/cryptonote_basic.h"
 #include "cryptonote_basic/account.h"
 #include "cryptonote_basic/cryptonote_basic_impl.h"
+#include "cryptonote_config.h"
 #include "cryptonote_core/tx_sanity_check.h"
+#include "cryptonote_core/pulse.h"
 #include "misc_language.h"
 #include "net/parse.h"
 #include "storages/http_abstract_invoke.h"
@@ -213,6 +219,17 @@ namespace cryptonote
   bool core_rpc_server::on_get_info(const COMMAND_RPC_GET_INFO::request& req, COMMAND_RPC_GET_INFO::response& res, const connection_context *ctx)
   {
     PERF_TIMER(on_get_info);
+    res.pos_fork_active = false;
+    res.pos_planned_hf_name.clear();
+    res.pos_planned_fork_height = 0;
+    res.pos_target_block_time_sec = 0;
+    res.pos_quorum_validators_min = 0;
+    res.pos_signature_threshold = 0;
+    res.pos_expects_sn_storage_server = false;
+    res.pos_pulse_blocks_since_fork = 0;
+    res.pos_pulse_next_round_wire_hint = 0;
+    res.pos_pulse_cum_diff_uses_60s_lwma = false;
+    res.pos_pulse_arqnet_vote_buffer_blocks = 0;
     bool r;
     if (use_bootstrap_daemon_if_necessary<COMMAND_RPC_GET_INFO>(invoke_http_mode::JON, "/getinfo", req, res, r))
     {
@@ -279,6 +296,53 @@ namespace cryptonote
     res.update_available = m_core.is_update_available();
     res.version = restricted ? std::to_string(ARQMA_VERSION[0]) : ARQMA_VERSION_STR;
     res.syncing = m_p2p.get_payload_object().currently_busy_syncing();
+
+    res.pos_fork_active = arqma::pulse_fork::fork_active(net_type);
+    if (restricted)
+    {
+      res.pos_planned_hf_name.clear();
+      res.pos_planned_fork_height = 0;
+      res.pos_target_block_time_sec = 0;
+      res.pos_quorum_validators_min = 0;
+      res.pos_signature_threshold = 0;
+      res.pos_expects_sn_storage_server = false;
+      res.pos_pulse_blocks_since_fork = 0;
+      res.pos_pulse_next_round_wire_hint = 0;
+      res.pos_pulse_cum_diff_uses_60s_lwma = false;
+      res.pos_pulse_arqnet_vote_buffer_blocks = 0;
+    }
+    else
+    {
+      res.pos_planned_hf_name = arqma::pulse_fork::HF_RELEASE_NAME;
+      res.pos_planned_fork_height = arqma::pulse_fork::planned_fork_height_for_net(net_type);
+      res.pos_target_block_time_sec = arqma::pulse_fork::PULSE_TARGET_BLOCK_TIME_SEC;
+      res.pos_quorum_validators_min = arqma::pulse_fork::PULSE_QUORUM_VALIDATORS_MIN;
+      res.pos_signature_threshold = arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD;
+      res.pos_expects_sn_storage_server = arqma::pulse_fork::POS_EXPECTS_STORAGE_SERVER_FOR_SERVICE_NODES;
+
+      uint64_t const fh = arqma::pulse_fork::planned_fork_height_for_net(net_type);
+      if (arqma::pulse_fork::fork_active(net_type) && fh > 0 && res.height > fh)
+        res.pos_pulse_blocks_since_fork = res.height - fh;
+      res.pos_pulse_next_round_wire_hint = res.height % 256;
+      {
+        cryptonote::Blockchain &bs = m_core.get_blockchain_storage();
+        uint64_t const next_h = bs.get_current_blockchain_height();
+        uint64_t prev_ts = 0;
+        if (next_h > 0)
+          prev_ts = bs.get_db().get_block_timestamp(next_h - 1);
+        if (auto timings = cryptonote::pulse::get_round_timings(bs, next_h, prev_ts))
+        {
+          uint8_t rnd = 0;
+          if (cryptonote::pulse::convert_time_to_round(bs.nettype(), std::chrono::system_clock::now(), timings->r0_timestamp, &rnd))
+            res.pos_pulse_next_round_wire_hint = rnd;
+        }
+        res.pos_pulse_cum_diff_uses_60s_lwma =
+            arqma::pulse_fork::fork_active(net_type)
+            && bs.get_ideal_hard_fork_version(next_h) >= cryptonote::network_version_20;
+        res.pos_pulse_arqnet_vote_buffer_blocks =
+            static_cast<uint64_t>(m_core.get_pulse_arqnet_vote_buffer_distinct_block_count());
+      }
+    }
 
     res.status = CORE_RPC_STATUS_OK;
     return true;
@@ -914,6 +978,17 @@ namespace cryptonote
       return true;
     }
 
+    const uint64_t chain_height_hf = m_core.get_current_blockchain_height();
+    const uint64_t next_height_hf = chain_height_hf + 1;
+    const uint8_t next_major_hf =
+        m_core.get_blockchain_storage().get_ideal_hard_fork_version(next_height_hf);
+    if (arqma::pulse_fork::pow_mining_disabled_for_chain(m_core.get_nettype(), next_major_hf, next_height_hf))
+    {
+      res.status = arqma::pulse_fork::POW_MINING_DISABLED_RPC_MESSAGE;
+      LOG_PRINT_L0(res.status);
+      return true;
+    }
+
     int max_concurrency_count = std::thread::hardware_concurrency() * 4;
 
     // if we couldn't detect threads, set it to a ridiculously high number
@@ -1351,6 +1426,19 @@ namespace cryptonote
       return false;
     }
 
+    {
+      const uint64_t chain_height_hf = m_core.get_current_blockchain_height();
+      const uint64_t next_height_hf = chain_height_hf + 1;
+      const uint8_t next_major_hf =
+          m_core.get_blockchain_storage().get_ideal_hard_fork_version(next_height_hf);
+      if (arqma::pulse_fork::pow_mining_disabled_for_chain(m_core.get_nettype(), next_major_hf, next_height_hf))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_POW_MINING_DISABLED;
+        error_resp.message = arqma::pulse_fork::POW_MINING_DISABLED_RPC_MESSAGE;
+        return false;
+      }
+    }
+
     block b;
     std::string blob_reserve;
     size_t reserved_offset;
@@ -1389,6 +1477,278 @@ namespace cryptonote
     res.blocktemplate_blob = string_tools::buff_to_hex_nodelimer(block_blob);
     res.blockhashing_blob = string_tools::buff_to_hex_nodelimer(hashing_blob);
     res.status = CORE_RPC_STATUS_OK;
+    return true;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  bool core_rpc_server::on_get_pulse_block_template(
+      const COMMAND_RPC_GET_PULSE_BLOCK_TEMPLATE::request& req,
+      COMMAND_RPC_GET_PULSE_BLOCK_TEMPLATE::response& res,
+      epee::json_rpc::error& error_resp,
+      const connection_context *ctx)
+  {
+    PERF_TIMER(on_get_pulse_block_template);
+
+    std::shared_lock bootstrap_lock{m_bootstrap_daemon_mutex};
+    if (m_should_use_bootstrap_daemon)
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "get_pulse_block_template is not supported when the bootstrap daemon is in use";
+      return false;
+    }
+    bootstrap_lock.unlock();
+
+    if (!check_core_ready())
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_CORE_BUSY;
+      error_resp.message = "Core is busy";
+      return false;
+    }
+
+    if (!arqma::pulse_fork::fork_active(m_core.get_nettype()))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message =
+          "PoW/PoS Hybrid RPC is not active for this network (use --stagenet at/after HF network_version 20, or test harness)";
+      return false;
+    }
+
+    {
+      uint64_t const next_h = m_core.get_current_blockchain_height() + 1;
+      uint8_t const next_maj = m_core.get_blockchain_storage().get_ideal_hard_fork_version(next_h);
+      if (!arqma::pulse_fork::is_pulse_slot_at_height(m_core.get_nettype(), next_h, next_maj))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message =
+            "Next chain height is a PoW slot (hybrid PoW/Pulse alternation): use get_block_template or PoW mining for this height";
+        return false;
+      }
+    }
+
+    if (req.pulse_round > 255)
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "pulse_round must be in 0..255";
+      return false;
+    }
+    if (req.validator_bitset > std::numeric_limits<uint16_t>::max())
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "validator_bitset must fit in 16 bits";
+      return false;
+    }
+
+    service_nodes::block_winner winner{};
+    if (!req.producer_pubkey.empty())
+    {
+      constexpr size_t pk_hex_len = sizeof(crypto::public_key) * 2;
+      if (req.producer_pubkey.size() != pk_hex_len)
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "producer_pubkey must be exactly 64 hex characters (service node public key)";
+        return false;
+      }
+      crypto::public_key producer{};
+      if (!epee::string_tools::hex_to_pod(req.producer_pubkey, producer))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "producer_pubkey is not valid hex";
+        return false;
+      }
+      if (!m_core.get_service_node_list().try_get_block_winner_for_service_node(producer, winner))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "producer_pubkey is not a registered active service node";
+        return false;
+      }
+    }
+    else
+    {
+      winner = m_core.get_service_node_list().get_block_winner();
+      if (winner.key == crypto::null_pkey)
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+        error_resp.message = "No service node block winner available for pulse template";
+        return false;
+      }
+    }
+
+    cryptonote::block b{};
+    uint64_t height = 0;
+    uint64_t expected_reward = 0;
+    uint64_t pulse_tpl_seed_height = 0;
+    crypto::hash pulse_tpl_seed_hash{};
+
+    if (!m_core.get_pulse_block_template(
+            b,
+            winner,
+            static_cast<uint8_t>(req.pulse_round),
+            static_cast<uint16_t>(req.validator_bitset),
+            height,
+            expected_reward,
+            pulse_tpl_seed_height,
+            pulse_tpl_seed_hash))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_INTERNAL_ERROR;
+      error_resp.message =
+          "Failed to create pulse block template (ideal HF >= network_version_20 and PoW/PoS Hybrid rules active?)";
+      return false;
+    }
+    (void)pulse_tpl_seed_height;
+    (void)pulse_tpl_seed_hash;
+
+    if (!req.pulse_random_value.empty())
+    {
+      std::string rnd_bin;
+      if (!string_tools::parse_hexstr_to_binbuff(req.pulse_random_value, rnd_bin)
+          || rnd_bin.size() != sizeof(b.pulse.random_value.data))
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "pulse_random_value must be exactly 32 hex characters (16 bytes)";
+        return false;
+      }
+      std::memcpy(b.pulse.random_value.data, rnd_bin.data(), sizeof(b.pulse.random_value.data));
+    }
+
+    if (req.merge_arqnet_votes)
+    {
+      b.invalidate_hashes();
+      crypto::hash const bh = cryptonote::get_block_hash(b);
+      uint64_t acc_chain_height = 0;
+      std::vector<cryptonote::pulse_validator_signature_entry> acc{};
+      if (m_core.copy_pulse_arqnet_vote_accumulator(bh, acc_chain_height, acc))
+      {
+        if (acc_chain_height != height)
+          MDEBUG("merge_arqnet_votes: vote accumulator chain_height " << acc_chain_height << " != template height " << height);
+        b.pulse_validator_signatures.clear();
+        size_t const cap = config::block_settings::MAX_PULSE_VALIDATOR_SIGNATURES;
+        uint16_t const vmask = static_cast<uint16_t>(req.validator_bitset);
+        b.pulse_validator_signatures.reserve(std::min(acc.size(), cap));
+        size_t skipped_bit_mismatch = 0;
+        for (cryptonote::pulse_validator_signature_entry const &e : acc)
+        {
+          if (b.pulse_validator_signatures.size() >= cap)
+            break;
+          if (!cryptonote::pulse::merge_vote_matches_validator_bitset(e.voter_index, vmask))
+          {
+            if (e.voter_index < 16)
+              ++skipped_bit_mismatch;
+            continue;
+          }
+          b.pulse_validator_signatures.push_back(e);
+        }
+        if (skipped_bit_mismatch)
+          MDEBUG("merge_arqnet_votes: skipped " << skipped_bit_mismatch
+                                                << " vote(s) (voter_index < 16 but template validator_bitset bit clear)");
+      }
+      else
+        MDEBUG("merge_arqnet_votes: no accumulator data for block hash " << bh);
+      b.invalidate_hashes();
+    }
+
+    res.difficulty = m_core.get_blockchain_storage().get_difficulty_for_next_block();
+    res.height = height;
+    res.expected_reward = expected_reward;
+    res.prev_hash = string_tools::pod_to_hex(b.prev_id);
+
+    crypto::hash seed_hash{};
+    crypto::hash next_seed_hash{};
+    seed_hash = next_seed_hash = crypto::null_hash;
+    uint64_t next_height = 0;
+    crypto::rx_seedheights(height, &res.seed_height, &next_height);
+    seed_hash = m_core.get_block_id_by_height(res.seed_height);
+    if (next_height != res.seed_height)
+      next_seed_hash = m_core.get_block_id_by_height(next_height);
+    res.seed_hash = string_tools::pod_to_hex(seed_hash);
+    if (seed_hash != next_seed_hash)
+      res.next_seed_hash = string_tools::pod_to_hex(next_seed_hash);
+
+    std::string const block_blob = t_serializable_object_to_blob(b);
+    std::string const hashing_blob = get_block_hashing_blob(b);
+    res.blocktemplate_blob = string_tools::buff_to_hex_nodelimer(block_blob);
+    res.blockhashing_blob = string_tools::buff_to_hex_nodelimer(hashing_blob);
+    b.invalidate_hashes();
+    {
+      crypto::hash const tpl_hash = get_block_hash(b);
+      res.pulse_template_block_hash = string_tools::pod_to_hex(tpl_hash);
+      res.merged_arqnet_vote_count = b.pulse_validator_signatures.size();
+      res.pulse_signature_threshold = static_cast<uint64_t>(arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD);
+      res.merged_pulse_signatures_meet_threshold =
+          res.merged_arqnet_vote_count >= res.pulse_signature_threshold;
+    }
+    res.status = CORE_RPC_STATUS_OK;
+    res.untrusted = false;
+    return true;
+  }
+  //------------------------------------------------------------------------------------------------------------------------------
+  bool core_rpc_server::on_get_pulse_arqnet_votes(
+      const COMMAND_RPC_GET_PULSE_ARQNET_VOTES::request& req,
+      COMMAND_RPC_GET_PULSE_ARQNET_VOTES::response& res,
+      epee::json_rpc::error& error_resp,
+      const connection_context *ctx)
+  {
+    PERF_TIMER(on_get_pulse_arqnet_votes);
+
+    {
+      std::shared_lock bootstrap_lock{m_bootstrap_daemon_mutex};
+      if (m_should_use_bootstrap_daemon)
+      {
+        error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+        error_resp.message = "get_pulse_arqnet_votes is not supported when the bootstrap daemon is in use";
+        return false;
+      }
+    }
+
+    if (!check_core_ready())
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_CORE_BUSY;
+      error_resp.message = "Core is busy";
+      return false;
+    }
+
+    if (!arqma::pulse_fork::fork_active(m_core.get_nettype()))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message =
+          "PoW/PoS Hybrid RPC is not active for this network (use --stagenet at/after HF network_version 20, or test harness)";
+      return false;
+    }
+
+    constexpr size_t hash_hex_len = sizeof(crypto::hash) * 2;
+    if (req.block_hash.size() != hash_hex_len)
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "block_hash must be exactly 64 hex characters";
+      return false;
+    }
+    crypto::hash bh{};
+    if (!epee::string_tools::hex_to_pod(req.block_hash, bh))
+    {
+      error_resp.code = CORE_RPC_ERROR_CODE_WRONG_PARAM;
+      error_resp.message = "block_hash is not valid hex";
+      return false;
+    }
+
+    uint64_t chain_h = 0;
+    std::vector<cryptonote::pulse_validator_signature_entry> entries;
+    bool const copied = m_core.copy_pulse_arqnet_vote_accumulator(bh, chain_h, entries);
+
+    res.block_hash = req.block_hash;
+    res.chain_height = chain_h;
+    res.found = copied;
+    res.votes.clear();
+    if (copied)
+    {
+      res.votes.reserve(entries.size());
+      for (cryptonote::pulse_validator_signature_entry const &e : entries)
+      {
+        COMMAND_RPC_GET_PULSE_ARQNET_VOTES::vote_row row{};
+        row.voter_index = e.voter_index;
+        row.signature = string_tools::pod_to_hex(e.signature);
+        res.votes.push_back(std::move(row));
+      }
+    }
+    res.status = CORE_RPC_STATUS_OK;
+    res.untrusted = false;
     return true;
   }
   //------------------------------------------------------------------------------------------------------------------------------
@@ -1437,11 +1797,20 @@ namespace cryptonote
       return false;
     }
 
-    block_verification_context bvc;
-    if(!m_core.handle_block_found(b, bvc))
+    block_verification_context bvc{};
+    if (!m_core.handle_block_found(b, bvc))
     {
       error_resp.code = CORE_RPC_ERROR_CODE_BLOCK_NOT_ACCEPTED;
-      error_resp.message = "Block not accepted";
+      std::string msg = "Block not accepted";
+      if (bvc.m_already_exists)
+        msg += ": duplicate block";
+      else if (bvc.m_marked_as_orphaned)
+        msg += ": orphaned (parent not main tip or alt-chain)";
+      else if (bvc.m_verification_failed)
+        msg += ": verification failed (Pulse quorum / PoW / tx rules — see daemon log)";
+      else
+        msg += ": rejected (prepare/relay path — see daemon log)";
+      error_resp.message = std::move(msg);
       return false;
     }
     res.status = CORE_RPC_STATUS_OK;

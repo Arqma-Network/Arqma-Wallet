@@ -30,7 +30,11 @@
 // Parts of this file are originally copyright (c) 2012-2013 The Cryptonote developers
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <cstdio>
+#include <cstring>
+#include <unordered_set>
 #include <boost/asio/dispatch.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/range/adaptor/reversed.hpp>
@@ -47,6 +51,7 @@
 #include "blockchain_db/blockchain_db.h"
 #include "cryptonote_basic/cryptonote_boost_serialization.h"
 #include "cryptonote_config.h"
+#include "common/arqma_pulse_fork.h"
 #include "cryptonote_basic/miner.h"
 #include "misc_language.h"
 #include "file_io_utils.h"
@@ -54,7 +59,9 @@
 #include "common/boost_serialization_helper.h"
 #include "common/threadpool.h"
 #include "warnings.h"
+#include "crypto/crypto.h"
 #include "crypto/hash.h"
+#include "cryptonote_basic/cryptonote_format_utils.h"
 #include "cryptonote_core.h"
 #include "ringct/rctSigs.h"
 #include "common/perf_timer.h"
@@ -91,6 +98,98 @@ extern "C" void rx_slow_hash_free_state();
 DISABLE_VS_WARNINGS(4267)
 
 #define MERROR_VER(x) MCERROR("verify", x)
+
+namespace
+{
+/**
+ * PoS-era block: serialized header reward must match total coinbase out (miner + SN payouts + gov + dev + net);
+ * sn_winner_tail ties to SN pubkey in miner extra. Gov/dev/net keep receiving on the same mainnet (or per-net) addresses
+ * as pre-PoS — see construct_miner_tx and cryptonote_config GOV_/DEV_/NET_WALLET_ADDRESS.
+ * Used from main-chain validate_miner_transaction and alternative-chain ingestion (stored alts skipped full miner validate until reorg).
+ */
+bool pulse_coinbase_matches_pulse_header(network_type nettype, block const &b)
+{
+  if (!arqma::pulse_fork::fork_active(nettype) || b.major_version < cryptonote::network_version_20)
+    return true;
+
+  uint64_t const coinbase_h = cryptonote::get_block_height(b);
+  if (arqma::pulse_fork::is_pow_slot_at_height(nettype, coinbase_h, b.major_version))
+  {
+    if (b.has_pulse_header_data() || !b.pulse_validator_signatures.empty())
+    {
+      MERROR_VER("PoW-slot block rejected: Pulse header or signatures must be empty");
+      return false;
+    }
+    return true;
+  }
+
+  uint64_t money_in_use = 0;
+  for (auto const &o : b.miner_tx.vout)
+    money_in_use += o.amount;
+
+  if (b.reward != money_in_use)
+  {
+    MERROR_VER(
+        "Pulse-era block miner tx total (" << print_money(money_in_use) << ") does not match block header reward (" << print_money(b.reward)
+                                           << ")");
+    return false;
+  }
+
+  crypto::public_key winner = cryptonote::get_service_node_winner_from_tx_extra(b.miner_tx.extra);
+  if (!winner)
+  {
+    MERROR_VER("Pulse-era block rejected: miner tx_extra has no valid service-node winner");
+    return false;
+  }
+
+  crypto::hash4 expect_tail{};
+  static_assert(sizeof(winner.data) >= 4, "public_key tail");
+  memcpy(expect_tail.data, winner.data + (sizeof(winner.data) - 4), 4);
+  if (!(b.sn_winner_tail == expect_tail))
+  {
+    MERROR_VER("Pulse-era block rejected: sn_winner_tail does not match last 4 bytes of coinbase SN winner pubkey");
+    return false;
+  }
+  return true;
+}
+
+static inline void apply_pulse_fields_for_block_template(network_type nettype, uint64_t block_height, block &b)
+{
+  if (b.major_version < cryptonote::network_version_20)
+  {
+    b.pulse = {};
+    b.reward = 0;
+    b.sn_winner_tail = crypto::null_hash4;
+    b.pulse_validator_signatures.clear();
+    b.invalidate_hashes();
+    return;
+  }
+  if (arqma::pulse_fork::is_pow_slot_at_height(nettype, block_height, b.major_version))
+  {
+    b.pulse = {};
+    b.reward = 0;
+    b.sn_winner_tail = crypto::null_hash4;
+    b.pulse_validator_signatures.clear();
+    b.invalidate_hashes();
+  }
+}
+
+/** Hybrid PoW slot: D_pow = max(1, (D_lwma_v16 * active_sn) / POW_DIFFICULTY_ACTIVE_SN_REFERENCE). */
+static difficulty_type scale_pow_difficulty_for_hybrid_pow_slot(difficulty_type lwma_base, std::size_t active_sn_count) noexcept
+{
+  uint64_t const kRef = arqma::pulse_fork::POW_DIFFICULTY_ACTIVE_SN_REFERENCE;
+  uint64_t const sn = static_cast<uint64_t>(active_sn_count < 1 ? 1 : active_sn_count);
+  if (lwma_base == 0)
+    return 0;
+  uint64_t const q = lwma_base / kRef;
+  uint64_t const r = lwma_base % kRef;
+  uint64_t const term2 = (r * sn) / kRef;
+  if (sn != 0 && q > std::numeric_limits<uint64_t>::max() / sn)
+    return std::numeric_limits<uint64_t>::max();
+  uint64_t const out = q * sn + term2;
+  return out ? out : UINT64_C(1);
+}
+} // namespace
 
 // used to overestimate the block reward when estimating a per kB to use
 #define BLOCK_REWARD_OVERESTIMATE (10 * 1000000000000)
@@ -823,9 +922,12 @@ bool Blockchain::get_block_by_hash(const crypto::hash &h, block &blk, bool *orph
   return false;
 }
 //------------------------------------------------------------------
-size_t get_difficulty_blocks_count(uint8_t version)
+size_t get_difficulty_blocks_count(network_type nettype, uint8_t version)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
+
+  if (version >= cryptonote::network_version_20 && arqma::pulse_fork::fork_active(nettype))
+    return DIFFICULTY_BLOCKS_COUNT_V16; /* next_diff Pulse uses DIFFICULTY_TARGET_V20_POS inside same LWMA window. */
 
   if(version < 7)
     return DIFFICULTY_BLOCKS_COUNT;
@@ -839,9 +941,12 @@ size_t get_difficulty_blocks_count(uint8_t version)
   return DIFFICULTY_BLOCKS_COUNT_V16;
 }
 //-----------------------------------------------------------------
-uint8_t get_current_diff_target(uint8_t version)
+uint8_t get_current_diff_target(network_type nettype, uint8_t version)
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
+
+  if (version >= cryptonote::network_version_20 && arqma::pulse_fork::fork_active(nettype))
+    return DIFFICULTY_TARGET_V20_POS;
 
   if(version < 10)
     return DIFFICULTY_TARGET_V2;
@@ -882,8 +987,9 @@ difficulty_type Blockchain::get_difficulty_for_next_block()
   top_hash = get_tail_id(height); // get it again now that we have the lock
   ++height; // top block height to blockchain height
 
-  uint8_t version = get_current_hard_fork_version();
-  size_t difficulty_blocks_count = get_difficulty_blocks_count(version);
+  // Use ideal HF for this chain height so the first block after a version bump (e.g. PoS) picks the right LWMA path.
+  uint8_t version = get_ideal_hard_fork_version(height);
+  size_t difficulty_blocks_count = get_difficulty_blocks_count(m_nettype, version);
 
   if (m_timestamps_and_difficulties_height != 0 && ((height - m_timestamps_and_difficulties_height) == 1) && m_timestamps.size() >= difficulty_blocks_count)
   {
@@ -925,6 +1031,14 @@ difficulty_type Blockchain::get_difficulty_for_next_block()
   }
 
   if(version >= 16) {
+    if (arqma::pulse_fork::fork_active(m_nettype) && version >= cryptonote::network_version_20
+        && arqma::pulse_fork::is_pow_slot_at_height(m_nettype, height, version))
+    {
+      difficulty_type const base = next_difficulty_v16(timestamps, difficulties);
+      return scale_pow_difficulty_for_hybrid_pow_slot(base, m_service_node_list.get_active_service_node_count());
+    }
+    if (arqma::pulse_fork::fork_active(m_nettype) && version >= cryptonote::network_version_20)
+      return next_difficulty_pulse_pos(timestamps, difficulties);
     return next_difficulty_v16(timestamps, difficulties);
   } else if(version >= 10) {
     return next_difficulty_lwma_4(timestamps, difficulties);
@@ -1108,8 +1222,8 @@ difficulty_type Blockchain::get_next_difficulty_for_alternative_chain(const std:
   LOG_PRINT_L3("Blockchain::" << __func__);
   std::vector<uint64_t> timestamps;
   std::vector<difficulty_type> cumulative_difficulties;
-  uint8_t version = get_current_hard_fork_version();
-  size_t difficulty_blocks_count = get_difficulty_blocks_count(version);
+  uint8_t version = get_ideal_hard_fork_version(alt_block_height);
+  size_t difficulty_blocks_count = get_difficulty_blocks_count(m_nettype, version);
 
   // if the alt chain isn't long enough to calculate the difficulty target
   // based on its blocks alone, need to get more blocks from the main chain
@@ -1163,6 +1277,14 @@ difficulty_type Blockchain::get_next_difficulty_for_alternative_chain(const std:
 
   // FIXME: This will fail if fork activation heights are subject to voting
   if(version >= 16) {
+    if (arqma::pulse_fork::fork_active(m_nettype) && version >= cryptonote::network_version_20
+        && arqma::pulse_fork::is_pow_slot_at_height(m_nettype, alt_block_height, version))
+    {
+      difficulty_type const base = next_difficulty_v16(timestamps, cumulative_difficulties);
+      return scale_pow_difficulty_for_hybrid_pow_slot(base, m_service_node_list.get_active_service_node_count());
+    }
+    if (arqma::pulse_fork::fork_active(m_nettype) && version >= cryptonote::network_version_20)
+      return next_difficulty_pulse_pos(timestamps, cumulative_difficulties);
     return next_difficulty_v16(timestamps, cumulative_difficulties);
   } else if(version >= 10) {
     return next_difficulty_lwma_4(timestamps, cumulative_difficulties);
@@ -1315,6 +1437,9 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
   CHECK_AND_ASSERT_MES(money_in_use >= fee, false, "Base Reward calculation bug");
   base_reward = money_in_use - fee;
 
+  if (!pulse_coinbase_matches_pulse_header(m_nettype, b))
+    return false;
+
 /*
   base_reward = reward_parts.adjusted_base_reward;
   if(base_reward + fee < money_in_use)
@@ -1327,6 +1452,160 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
   base_reward = money_in_use - fee;
 */
   return true;
+}
+//------------------------------------------------------------------
+bool Blockchain::verify_pulse_fork_block_rules(const cryptonote::block &bl, cryptonote::block_verification_context &bvc, const char *context) const
+{
+  if (!arqma::pulse_fork::fork_active(m_nettype) || bl.major_version < cryptonote::network_version_20)
+    return true;
+
+  uint64_t const pulse_bh = cryptonote::get_block_height(bl);
+  if (arqma::pulse_fork::is_pow_slot_at_height(m_nettype, pulse_bh, bl.major_version))
+  {
+    if (bl.has_pulse_header_data() || !bl.pulse_validator_signatures.empty())
+    {
+      MERROR_VER("PoW-slot block rejected (" << context << "): Pulse header or validator signatures must be empty");
+      bvc.m_verification_failed = true;
+      return false;
+    }
+    return true;
+  }
+
+  if (!bl.has_pulse_header_data())
+  {
+    MERROR_VER("Pulse-era block rejected (" << context << "): pulse_header must be non-empty (random_value / round / validator bitset)");
+    bvc.m_verification_failed = true;
+    return false;
+  }
+
+  static constexpr pulse_random_value pulse_random_all_zero{};
+  if (bl.pulse.random_value == pulse_random_all_zero)
+  {
+    MERROR_VER("Pulse-era block rejected (" << context << "): pulse random_value must be non-zero for round preimage binding");
+    bvc.m_verification_failed = true;
+    return false;
+  }
+
+  if (bl.pulse_validator_signatures.size() < arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD)
+  {
+    MERROR_VER("Pulse-era block rejected (" << context << "): insufficient validator signature entries (need "
+                                            << arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD << ", have "
+                                            << bl.pulse_validator_signatures.size() << ")");
+    bvc.m_verification_failed = true;
+    return false;
+  }
+
+  crypto::hash const block_hash = cryptonote::get_block_hash(bl);
+  uint64_t const block_height = pulse_bh;
+  if (block_height == 0)
+  {
+    MERROR_VER("Pulse-era block rejected (" << context << "): cannot resolve checkpointing quorum at height 0");
+    bvc.m_verification_failed = true;
+    return false;
+  }
+
+  uint64_t const quorum_height = block_height - 1;
+  std::vector<std::shared_ptr<const service_nodes::quorum>> alt_quorums;
+  std::shared_ptr<const service_nodes::quorum> main_quorum =
+      m_service_node_list.get_quorum(service_nodes::quorum_type::checkpointing, quorum_height, true, &alt_quorums);
+
+  std::vector<std::shared_ptr<const service_nodes::quorum>> try_quorums;
+  if (main_quorum)
+    try_quorums.push_back(main_quorum);
+  for (std::shared_ptr<const service_nodes::quorum> const &aq : alt_quorums)
+  {
+    if (aq && aq != main_quorum)
+      try_quorums.push_back(aq);
+  }
+
+  if (try_quorums.empty())
+  {
+    MERROR_VER("Pulse-era block rejected (" << context << "): no checkpointing quorum at height " << quorum_height);
+    bvc.m_verification_failed = true;
+    return false;
+  }
+
+  {
+    bool any_quorum_large_enough = false;
+    for (std::shared_ptr<const service_nodes::quorum> const &qp : try_quorums)
+    {
+      if (qp && qp->validators.size() >= arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD)
+      {
+        any_quorum_large_enough = true;
+        break;
+      }
+    }
+    if (!any_quorum_large_enough)
+    {
+      MERROR_VER("Pulse-era block rejected (" << context << "): no checkpointing quorum has at least "
+                                              << arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD
+                                              << " validators at height " << quorum_height);
+      bvc.m_verification_failed = true;
+      return false;
+    }
+  }
+
+  auto const quorum_ok = [&bl, &block_hash](std::shared_ptr<const service_nodes::quorum> const &qptr) -> bool {
+    if (!qptr || qptr->validators.empty())
+      return false;
+
+    size_t const V = qptr->validators.size();
+    uint16_t const vb = bl.pulse.validator_bitset;
+
+    uint32_t const allowed_mask = (V >= 16) ? 0xFFFFu : ((1u << static_cast<uint32_t>(V)) - 1u);
+    if ((static_cast<uint32_t>(vb) & ~allowed_mask) != 0)
+      return false;
+
+    std::unordered_set<uint16_t> verified_lo;
+    std::unordered_set<uint16_t> verified_hi;
+    for (cryptonote::pulse_validator_signature_entry const &entry : bl.pulse_validator_signatures)
+    {
+      if (entry.voter_index >= V)
+        continue;
+      if (!crypto::check_signature(block_hash, qptr->validators[entry.voter_index], entry.signature))
+        continue;
+
+      if (entry.voter_index < 16)
+      {
+        if (((vb >> entry.voter_index) & 1) == 0)
+          continue;
+        auto const ins = verified_lo.insert(entry.voter_index);
+        if (!ins.second)
+          continue;
+      }
+      else
+      {
+        auto const ins = verified_hi.insert(entry.voter_index);
+        if (!ins.second)
+          continue;
+      }
+    }
+
+    if (verified_lo.size() + verified_hi.size() < arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD)
+      return false;
+
+    size_t const max_bit = std::min<size_t>(V, 16);
+    for (size_t i = 0; i < max_bit; ++i)
+    {
+      if (((vb >> i) & 1u) != 0 && !verified_lo.count(static_cast<uint16_t>(i)))
+        return false;
+    }
+    return true;
+  };
+
+  for (std::shared_ptr<const service_nodes::quorum> const &qptr : try_quorums)
+  {
+    if (quorum_ok(qptr))
+      return true;
+  }
+
+  MERROR_VER(
+      "Pulse-era block rejected (" << context << "): fewer than "
+                                   << arqma::pulse_fork::PULSE_SIGNATURE_THRESHOLD
+                                   << " valid validator signatures matching pulse.validator_bitset vs known quorums at height "
+                                   << quorum_height);
+  bvc.m_verification_failed = true;
+  return false;
 }
 //------------------------------------------------------------------
 // get the block weights of the last <count> blocks, and return by reference <sz>.
@@ -1428,6 +1707,7 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
       MDEBUG("Using cached template");
       m_btc.timestamp = time(NULL); // update timestamp unconditionally
       b = m_btc;
+      apply_pulse_fields_for_block_template(m_nettype, height, b);
       diffic = m_btc_difficulty;
       height = m_btc_height;
       expected_reward = m_btc_expected_reward;
@@ -1466,7 +1746,7 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
       CHECK_AND_ASSERT_MES(get_block_by_hash(*from_block, prev_block), false, "From block not found"); // TODO
       uint64_t from_block_height = cryptonote::get_block_height(prev_block);
       height = from_block_height + 1;
-      if(m_hardfork->get_current_version() >= RX_BLOCK_VERSION)
+      if (m_hardfork->get_ideal_version(height) >= RX_BLOCK_VERSION)
       {
         uint64_t seed_height, next_height;
         crypto::rx_seedheights(height, &seed_height, &next_height);
@@ -1522,13 +1802,13 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
   else
   {
     height = m_db->height();
-    b.major_version = m_hardfork->get_current_version();
+    b.major_version = m_hardfork->get_ideal_version(height);
     b.minor_version = m_hardfork->get_ideal_version();
     b.prev_id = get_tail_id();
     median_weight = m_current_block_cumul_weight_limit / 2;
     diffic = get_difficulty_for_next_block();
     already_generated_coins = m_db->get_block_already_generated_coins(height - 1);
-    if(m_hardfork->get_current_version() >= RX_BLOCK_VERSION)
+    if (b.major_version >= RX_BLOCK_VERSION)
     {
       uint64_t next_height, seed_height;
       crypto::rx_seedheights(height, &seed_height, &next_height);
@@ -1536,10 +1816,20 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
     }
   }
 
+  apply_pulse_fields_for_block_template(m_nettype, height, b);
+
+  if (arqma::pulse_fork::pow_mining_disabled_for_chain(m_nettype, b.major_version, height))
+  {
+    MINFO("rejecting PoW block template height " << height << ", major_ver " << (unsigned)b.major_version
+          << " (PoW/PoS Hybrid: Pulse slot or PoW-disabled path)");
+    return false;
+  }
+
   b.timestamp = time(NULL);
 
-  uint8_t hf_version = m_hardfork->get_current_version();
-  uint64_t blockchain_timestamp_check_window = hf_version > 9 ? BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V11 : BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V9;
+  uint8_t const hf_version_for_next = m_hardfork->get_ideal_version(height);
+  uint64_t blockchain_timestamp_check_window =
+      hf_version_for_next > 9 ? BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V11 : BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V9;
 
   if(m_db->height() >= blockchain_timestamp_check_window)
   {
@@ -1620,6 +1910,143 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
 bool Blockchain::create_block_template(block& b, const account_public_address& miner_address, difficulty_type& diffic, uint64_t& height, uint64_t& expected_reward, const std::string& ex_nonce, uint64_t &seed_height, crypto::hash &seed_hash)
 {
   return create_block_template(b, NULL, miner_address, diffic, height, expected_reward, ex_nonce, seed_height, seed_hash);
+}
+//------------------------------------------------------------------
+bool Blockchain::create_next_pulse_block_template(
+    block &b,
+    service_nodes::block_winner const &pulse_producer,
+    uint8_t round,
+    uint16_t validator_bitset,
+    uint64_t &height,
+    uint64_t &expected_reward,
+    uint64_t &seed_height,
+    crypto::hash &seed_hash)
+{
+  if (!arqma::pulse_fork::fork_active(m_nettype))
+    return false;
+
+  LOG_PRINT_L3("Blockchain::" << __func__);
+  seed_hash = crypto::null_hash;
+
+  auto lock = tools::unique_locks(m_tx_pool, *this);
+  invalidate_block_template_cache();
+
+  height = m_db->height();
+  uint8_t const ideal_major = m_hardfork->get_ideal_version(height);
+  if (ideal_major < cryptonote::network_version_20)
+    return false;
+
+  if (!arqma::pulse_fork::is_pulse_slot_at_height(m_nettype, height, ideal_major))
+    return false;
+
+  b.major_version = ideal_major;
+  b.minor_version = m_hardfork->get_ideal_version();
+  b.prev_id = get_tail_id();
+  b.nonce = 0;
+  b.tx_hashes.clear();
+  b.miner_tx = {};
+
+  size_t median_weight = m_current_block_cumul_weight_limit / 2;
+  difficulty_type diffic = get_difficulty_for_next_block();
+  CHECK_AND_ASSERT_MES(diffic, false, "difficulty overhead.");
+  uint64_t already_generated_coins = m_db->get_block_already_generated_coins(height - 1);
+
+  if (m_hardfork->get_current_version() >= RX_BLOCK_VERSION)
+  {
+    uint64_t next_height, rx_seed_height;
+    crypto::rx_seedheights(height, &rx_seed_height, &next_height);
+    seed_height = rx_seed_height;
+    seed_hash = get_block_id_by_height(rx_seed_height);
+  }
+
+  b.timestamp = time(NULL);
+
+  uint8_t hf_version = m_hardfork->get_current_version();
+  uint64_t blockchain_timestamp_check_window =
+      hf_version > 9 ? BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V11 : BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW_V9;
+
+  if (m_db->height() >= blockchain_timestamp_check_window)
+  {
+    std::vector<uint64_t> timestamps;
+    auto h = m_db->height();
+
+    for (size_t offset = h - blockchain_timestamp_check_window; offset < h; ++offset)
+      timestamps.push_back(m_db->get_block_timestamp(offset));
+    uint64_t median_ts = epee::misc_utils::median(timestamps);
+    if (b.timestamp < median_ts)
+      b.timestamp = median_ts;
+  }
+
+  size_t txs_weight;
+  uint64_t fee;
+  if (!m_tx_pool.fill_block_template(b, median_weight, already_generated_coins, txs_weight, fee, expected_reward, b.major_version, m_db->height()))
+    return false;
+
+  account_public_address const miner_address{};
+  uint8_t hard_fork_version = b.major_version;
+  cryptonote::arqma_miner_tx_context miner_tx_context(m_nettype, pulse_producer);
+
+  bool r = construct_miner_tx(this, height, median_weight, already_generated_coins, txs_weight, fee, miner_address, b.miner_tx, {}, hard_fork_version, miner_tx_context);
+  CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx (pulse template), first chance");
+
+  size_t cumulative_weight = txs_weight + get_transaction_weight(b.miner_tx);
+  for (size_t try_count = 0; try_count != 10; ++try_count)
+  {
+    r = construct_miner_tx(this, height, median_weight, already_generated_coins, cumulative_weight, fee, miner_address, b.miner_tx, {}, hard_fork_version, miner_tx_context);
+    CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx (pulse template), second chance");
+
+    size_t coinbase_weight = get_transaction_weight(b.miner_tx);
+    if (coinbase_weight > cumulative_weight - txs_weight)
+    {
+      cumulative_weight = txs_weight + coinbase_weight;
+      continue;
+    }
+
+    if (coinbase_weight < cumulative_weight - txs_weight)
+    {
+      size_t delta = cumulative_weight - txs_weight - coinbase_weight;
+      b.miner_tx.extra.insert(b.miner_tx.extra.end(), delta, 0);
+      if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+      {
+        CHECK_AND_ASSERT_MES(cumulative_weight + 1 == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected miner tx weight (pulse)");
+        b.miner_tx.extra.resize(b.miner_tx.extra.size() - 1);
+        if (cumulative_weight != txs_weight + get_transaction_weight(b.miner_tx))
+        {
+          cumulative_weight += delta - 1;
+          continue;
+        }
+      }
+    }
+
+    CHECK_AND_ASSERT_MES(cumulative_weight == txs_weight + get_transaction_weight(b.miner_tx), false, "unexpected cumulative weight (pulse)");
+
+    b.pulse_validator_signatures.clear();
+    static constexpr pulse_random_value zero_random{};
+    b.pulse.random_value = zero_random;
+    b.pulse.round = round;
+    b.pulse.validator_bitset = validator_bitset;
+
+    uint64_t money_in_use = 0;
+    for (auto const &o : b.miner_tx.vout)
+      money_in_use += o.amount;
+    b.reward = money_in_use;
+
+    crypto::public_key winner = cryptonote::get_service_node_winner_from_tx_extra(b.miner_tx.extra);
+    if (winner == crypto::null_pkey)
+    {
+      MERROR("Pulse template: miner tx has no service-node winner in extra");
+      return false;
+    }
+
+    static_assert(sizeof(winner.data) >= 4, "public key tail");
+    memcpy(b.sn_winner_tail.data, winner.data + (sizeof(winner.data) - 4), 4);
+
+    b.invalidate_hashes();
+    return true;
+  }
+
+  LOG_ERROR("Failed to create_next_pulse_block_template after retries");
+  return false;
 }
 //------------------------------------------------------------------
 // for an alternate chain, get the timestamps from the main chain to complete
@@ -1832,44 +2259,64 @@ bool Blockchain::handle_alternative_block(const block& b, const crypto::hash& id
     // Check the block's hash against the difficulty target for its alt chain
     difficulty_type current_diff = get_next_difficulty_for_alternative_chain(alt_chain, block_height);
     CHECK_AND_ASSERT_MES(current_diff, false, "!!!!!!! DIFFICULTY OVERHEAD !!!!!!!");
+    const bool pulse_skip_pow_alt =
+        arqma::pulse_fork::fork_active(m_nettype) &&
+        b.major_version >= cryptonote::network_version_20 &&
+        !arqma::pulse_fork::is_pow_slot_at_height(m_nettype, block_height, b.major_version);
     crypto::hash proof_of_work;
     memset(proof_of_work.data, 0xff, sizeof(proof_of_work.data));
-    if(b.major_version >= RX_BLOCK_VERSION)
+    if (!pulse_skip_pow_alt)
     {
-      crypto::hash seedhash = null_hash;
-      uint64_t seedheight = rx_seedheight(block_height);
-      // seedblock is on the alt chain somewhere
-      if(alt_chain.size() && alt_chain.front().height <= seedheight)
+      if(b.major_version >= RX_BLOCK_VERSION)
       {
-        for (auto it=alt_chain.begin(); it != alt_chain.end(); it++)
+        crypto::hash seedhash = null_hash;
+        uint64_t seedheight = rx_seedheight(block_height);
+        // seedblock is on the alt chain somewhere
+        if(alt_chain.size() && alt_chain.front().height <= seedheight)
         {
-          if(it->height == seedheight+1)
+          for (auto it=alt_chain.begin(); it != alt_chain.end(); it++)
           {
-            seedhash = it->bl.prev_id;
-            break;
+            if(it->height == seedheight+1)
+            {
+              seedhash = it->bl.prev_id;
+              break;
+            }
           }
         }
+        else
+        {
+          seedhash = get_block_id_by_height(seedheight);
+        }
+        get_altblock_longhash(b, proof_of_work, seedhash);
       }
       else
       {
-        seedhash = get_block_id_by_height(seedheight);
+        get_block_longhash(this, b, proof_of_work, block_height, 0);
       }
-      get_altblock_longhash(b, proof_of_work, seedhash);
+      if(!check_hash(proof_of_work, current_diff))
+      {
+        MERROR_VER("Block with id: " << id << std::endl << " for alternative chain, does not have enough proof of work: " << proof_of_work << std::endl << " expected difficulty: " << current_diff);
+        bvc.m_verification_failed = true;
+        return false;
+      }
     }
     else
     {
-      get_block_longhash(this, b, proof_of_work, block_height, 0);
-    }
-    if(!check_hash(proof_of_work, current_diff))
-    {
-      MERROR_VER("Block with id: " << id << std::endl << " for alternative chain, does not have enough proof of work: " << proof_of_work << std::endl << " expected difficulty: " << current_diff);
-      bvc.m_verification_failed = true;
-      return false;
+      MDEBUG(
+          "PoW skipped for alternative block (Pulse; height "
+          << block_height << "); quorum signatures verified in service_node_list::alt_block_added");
     }
 
     if(!prevalidate_miner_transaction(b, block_height, hard_fork_version))
     {
       MERROR_VER("Block with id: " << epee::string_tools::pod_to_hex(id) << " (as alternative) has incorrect miner transaction.");
+      bvc.m_verification_failed = true;
+      return false;
+    }
+
+    if (!pulse_coinbase_matches_pulse_header(m_nettype, b))
+    {
+      MERROR_VER("Block with id: " << id << " (alternative) failed Pulse-era coinbase / header sanity");
       bvc.m_verification_failed = true;
       return false;
     }
@@ -3934,21 +4381,37 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
 #endif
   if(!fast_check)
   {
-    auto it = m_blocks_longhash_table.find(id);
-    if (it != m_blocks_longhash_table.end())
+    const bool pulse_skip_pow =
+        arqma::pulse_fork::fork_active(m_nettype) &&
+        bl.major_version >= cryptonote::network_version_20 &&
+        !arqma::pulse_fork::is_pow_slot_at_height(m_nettype, blockchain_height, bl.major_version);
+    if (pulse_skip_pow)
     {
-      precomputed = true;
-      proof_of_work = it->second;
+      // Pulse blocks omit PoW; signature checks run in service_node_list::block_added (same layering as oxen-core).
+      MDEBUG(
+          "PoW skipped for major_version="
+          << (unsigned)bl.major_version
+          << " at height " << blockchain_height
+          << " (Pulse: quorum signatures verified in service_node_list hook)");
     }
     else
-      proof_of_work = get_block_longhash(this, bl, blockchain_height, 0);
-
-    // validate proof_of_work versus difficulty target
-    if(!check_hash(proof_of_work, current_diffic))
     {
-      MERROR_VER("Block with id: " << id << std::endl << "does not have enough proof of work: " << proof_of_work << " at height " << blockchain_height << ", unexpected difficulty: " << current_diffic);
-      bvc.m_verification_failed = true;
-      return false;
+      auto it = m_blocks_longhash_table.find(id);
+      if (it != m_blocks_longhash_table.end())
+      {
+        precomputed = true;
+        proof_of_work = it->second;
+      }
+      else
+        proof_of_work = get_block_longhash(this, bl, blockchain_height, 0);
+
+      // validate proof_of_work versus difficulty target
+      if(!check_hash(proof_of_work, current_diffic))
+      {
+        MERROR_VER("Block with id: " << id << std::endl << "does not have enough proof of work: " << proof_of_work << " at height " << blockchain_height << ", unexpected difficulty: " << current_diffic);
+        bvc.m_verification_failed = true;
+        return false;
+      }
     }
   }
 
@@ -4201,10 +4664,28 @@ bool Blockchain::handle_block_to_main_chain(const block& bl, const crypto::hash&
   }
 
   abort_block.cancel();
-  MINFO(std::endl << "****** BLOCK SUCCESSFULLY ADDED ******" << std::endl << "id:\t" << id << std::endl << "PoW:\t" << proof_of_work << std::endl << "HEIGHT " << new_height-1 << ", difficulty:\t"
+  bool const pulse_block_added =
+      arqma::pulse_fork::fork_active(m_nettype) && bl.major_version >= cryptonote::network_version_20
+      && arqma::pulse_fork::is_pulse_slot_at_height(m_nettype, new_height - 1, bl.major_version);
+  if (pulse_block_added)
+  {
+    MINFO(
+        std::endl
+        << "****** PULSE BLOCK SUCCESSFULLY ADDED ******" << std::endl
+        << "id:\t" << id << std::endl
+        << "HEIGHT " << new_height - 1 << ", v" << static_cast<unsigned>(bl.major_version) << "." << +bl.minor_version << std::endl
+        << "block reward: " << print_money(base_reward + fee_summary) << "(" << print_money(base_reward) << " + " << print_money(fee_summary) << ")"
+        << std::endl
+        << "coinbase_weight: " << coinbase_weight << ", cumulative weight: " << cumulative_block_weight << ", "
+        << tools::friendly_duration(block_processing_time));
+  }
+  else
+  {
+    MINFO(std::endl << "****** BLOCK SUCCESSFULLY ADDED ******" << std::endl << "id:\t" << id << std::endl << "PoW:\t" << proof_of_work << std::endl << "HEIGHT " << new_height-1 << ", difficulty:\t"
          << current_diffic << std::endl << "block reward: " << print_money(base_reward + fee_summary) << "(" << print_money(base_reward) << " + " << print_money(fee_summary) << ")"
          << std::endl << "block reward unlock time: " << miner_unlock << std::endl << "coinbase_weight: " << coinbase_weight
          << ", cumulative weight: " << cumulative_block_weight << ", " << tools::friendly_duration(block_processing_time) << "(" << tools::friendly_duration(target_calculating_time) << "/" << tools::friendly_duration(longhash_calculating_time) << ")");
+  }
   if(m_show_time_stats)
   {
     MINFO("Height: " << new_height << " coinbase weight: " << coinbase_weight << " cumm: "
@@ -5128,8 +5609,12 @@ bool Blockchain::get_hard_fork_voting_info(uint8_t version, uint32_t &window, ui
 uint64_t Blockchain::get_difficulty_target() const
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
-  uint8_t version = get_current_hard_fork_version();
-  return get_current_diff_target(version);
+  uint64_t const next_h = get_current_blockchain_height();
+  uint8_t const version = get_ideal_hard_fork_version(next_h);
+  if (arqma::pulse_fork::fork_active(m_nettype) && version >= cryptonote::network_version_20
+      && arqma::pulse_fork::is_pow_slot_at_height(m_nettype, next_h, version))
+    return DIFFICULTY_TARGET_V16;
+  return get_current_diff_target(m_nettype, version);
 }
 
 std::map<uint64_t, std::tuple<uint64_t, uint64_t, uint64_t>> Blockchain::get_output_histogram(const std::vector<uint64_t> &amounts, bool unlocked, uint64_t recent_cutoff, uint64_t min_count) const
