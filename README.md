@@ -53,7 +53,7 @@ The wallet does one job, which is holding and moving ARQ on a single chain. It i
 - You run a node or a service node and want a wallet that can point at a local daemon instead of a stranger's server.
 - You are evaluating the wallet before trusting it with a balance, and you want to read the code, the hashes and the release history first.
 
-## Install
+## Install.
 
 <details open>
 <summary><img alt="Windows" src="assets/platform-windows.png"></summary>
