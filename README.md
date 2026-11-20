@@ -53,7 +53,7 @@ The wallet does one job, which is holding and moving ARQ on a single chain. It i
 - You run a node or a service node and want a wallet that can point at a local daemon instead of a stranger's server.
 - You are evaluating the wallet before trusting it with a balance, and you want to read the code, the hashes and the release history first.
 
-## Install
+## Install.
 
 <details open>
 <summary><img alt="Windows" src="https://img.shields.io/badge/platform-Windows-d6efff?style=flat-square&labelColor=090d16&logo=data:image/svg%2Bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTAgM2wxMC0xdjEwSDB6TTExIDJsMTMtMnYxMkgxMXpNMCAxM2gxMHYxMGwtMTAtMXpNMTEgMTNoMTN2MTFsLTEzLTJ6Ii8%2BPC9zdmc%2B&logoColor=f9fcff"></summary>
